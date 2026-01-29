@@ -185,7 +185,7 @@ def get_bank_balances():
     journals = odoo_search_read(
         "account.journal",
         [("type", "=", "bank")],
-        ["name", "company_id", "current_balance"],
+        ["name", "company_id", "current_statement_balance"],
         limit=20
     )
     return journals
