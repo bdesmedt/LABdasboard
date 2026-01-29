@@ -295,13 +295,27 @@ def odoo_call(model, method, domain=None, fields=None, limit=None, timeout=120):
 
 @st.cache_data(ttl=300)
 def get_bank_balances():
-    """Haal alle banksaldi op per rekening"""
+    """Haal alle banksaldi op per rekening (excl. R/C intercompany)"""
     journals = odoo_call(
         "account.journal", "search_read",
         [["type", "=", "bank"]],
         ["name", "company_id", "default_account_id", "current_statement_balance"]
     )
-    return journals
+    # Filter R/C rekeningen eruit - dit zijn intercompany vorderingen, geen bankrekeningen
+    bank_only = [j for j in journals if "R/C" not in j.get("name", "")]
+    return bank_only
+
+@st.cache_data(ttl=300)
+def get_rc_balances():
+    """Haal R/C (Rekening Courant) intercompany saldi op"""
+    journals = odoo_call(
+        "account.journal", "search_read",
+        [["type", "=", "bank"]],
+        ["name", "company_id", "default_account_id", "current_statement_balance"]
+    )
+    # Alleen R/C rekeningen - intercompany vorderingen
+    rc_only = [j for j in journals if "R/C" in j.get("name", "")]
+    return rc_only
 
 @st.cache_data(ttl=300)
 def get_revenue_data(year, company_id=None):
@@ -571,7 +585,8 @@ def main():
     with tabs[1]:
         st.header("🏦 Banksaldi per Rekening")
         
-        bank_data = get_bank_balances()
+        bank_data = get_bank_balances()  # Excl. R/C
+        rc_data = get_rc_balances()  # R/C intercompany
         
         if bank_data:
             # Groepeer per bedrijf
@@ -643,6 +658,38 @@ def main():
                 st.plotly_chart(fig2, use_container_width=True)
         else:
             st.warning("Geen bankdata beschikbaar")
+        
+        # =====================================================================
+        # R/C INTERCOMPANY VORDERINGEN (apart van bankrekeningen)
+        # =====================================================================
+        if rc_data:
+            st.markdown("---")
+            st.subheader("🔄 R/C Intercompany Vorderingen")
+            st.info("💡 Dit zijn rekening-courant posities met groepsmaatschappijen, geen bankrekeningen.")
+            
+            rc_by_company = {}
+            for r in rc_data:
+                comp = r.get("company_id")
+                if comp:
+                    comp_id = comp[0]
+                    comp_name = COMPANIES.get(comp_id, comp[1])
+                    if comp_name not in rc_by_company:
+                        rc_by_company[comp_name] = []
+                    rc_by_company[comp_name].append({
+                        "Rekening": r.get("name", "Onbekend"),
+                        "Saldo": r.get("current_statement_balance", 0)
+                    })
+            
+            # Totalen
+            rc_totals = {comp: sum(r["Saldo"] for r in reks) for comp, reks in rc_by_company.items()}
+            
+            for comp_name in ["LAB Conceptstore", "LAB Shops", "LAB Projects"]:
+                if comp_name in rc_by_company:
+                    total = rc_totals.get(comp_name, 0)
+                    with st.expander(f"🔄 {comp_name} - €{total:,.2f}", expanded=False):
+                        df_rc = pd.DataFrame(rc_by_company[comp_name])
+                        df_rc["Saldo"] = df_rc["Saldo"].apply(lambda x: f"€{x:,.2f}")
+                        st.dataframe(df_rc, use_container_width=True, hide_index=True)
     
     # =========================================================================
     # TAB 3: FACTUREN
@@ -1007,4 +1054,4 @@ def main():
         )
 
 if __name__ == "__main__":
-    main()
+    main()main()
