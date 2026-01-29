@@ -276,7 +276,9 @@ def main():
     # Sidebar filters
     with st.sidebar:
         st.header("🎛️ Filters")
-        selected_year = st.selectbox("📅 Jaar", range(current_year, 2022, -1)  # = [2026, 2025, 2024, 2023])
+        from datetime import datetime
+        current_year = datetime.now().year
+        selected_year = st.selectbox("📅 Jaar", list(range(current_year, 2022, -1)))
         
         company_options = {"Alle entiteiten": None}
         company_options.update({v["name"]: k for k, v in COMPANIES.items()})
@@ -438,3 +440,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
