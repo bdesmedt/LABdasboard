@@ -523,6 +523,40 @@ def get_product_categories():
     return {p["id"]: p.get("categ_id", [None, "Onbekend"]) for p in products}
 
 @st.cache_data(ttl=300)
+def get_pos_product_sales(year, company_id=None):
+    """Haal POS verkopen op met productinfo (voor LAB Conceptstore)"""
+    # Haal POS orders op voor het jaar
+    domain = [
+        ["state", "in", ["paid", "done", "invoiced"]],
+        ["date_order", ">=", f"{year}-01-01"],
+        ["date_order", "<=", f"{year}-12-31 23:59:59"]
+    ]
+    if company_id:
+        domain.append(["company_id", "=", company_id])
+    
+    orders = odoo_call(
+        "pos.order", "search_read",
+        domain,
+        ["id", "name", "date_order", "amount_total"],
+        limit=50000
+    )
+    
+    if not orders:
+        return []
+    
+    order_ids = [o["id"] for o in orders]
+    
+    # Haal orderregels op met product en categorie
+    lines = odoo_call(
+        "pos.order.line", "search_read",
+        [["order_id", "in", order_ids]],
+        ["product_id", "price_subtotal_incl", "price_subtotal", "qty", "order_id"],
+        limit=100000
+    )
+    
+    return lines
+
+@st.cache_data(ttl=300)
 def get_top_products(year, company_id=None, limit=20):
     """Haal top producten op met omzet"""
     domain = [
@@ -1061,8 +1095,17 @@ def main():
         with prod_subtabs[0]:
             st.subheader("📦 Omzet per Productcategorie")
             
-            product_sales = get_product_sales(selected_year, company_id)
-            product_cats = get_product_categories()
+            # LAB Conceptstore (ID 1) gebruikt POS data, anderen account.move.line
+            is_conceptstore = company_id == 1
+            
+            if is_conceptstore:
+                st.caption("📍 Data uit POS orders (Conceptstore)")
+                pos_sales = get_pos_product_sales(selected_year, company_id)
+                product_cats = get_product_categories()
+                product_sales = pos_sales  # Voor compatibiliteit
+            else:
+                product_sales = get_product_sales(selected_year, company_id)
+                product_cats = get_product_categories()
             
             if product_sales:
                 # Groepeer per categorie
@@ -1075,8 +1118,10 @@ def main():
                         cat_name = cat[1] if cat else "Onbekend"
                         if cat_name not in cat_data:
                             cat_data[cat_name] = {"Omzet": 0, "Aantal": 0}
+                        # POS gebruikt qty, account.move.line gebruikt quantity
+                        qty_field = "qty" if is_conceptstore else "quantity"
                         cat_data[cat_name]["Omzet"] += p.get("price_subtotal", 0)
-                        cat_data[cat_name]["Aantal"] += p.get("quantity", 0)
+                        cat_data[cat_name]["Aantal"] += p.get(qty_field, 0)
                 
                 df_cat = pd.DataFrame([
                     {"Categorie": k, "Omzet": v["Omzet"], "Aantal": v["Aantal"]}
@@ -1110,12 +1155,41 @@ def main():
         with prod_subtabs[1]:
             st.subheader("🏅 Top 20 Producten")
             
-            top_products = get_top_products(selected_year, company_id, limit=20)
+            # LAB Conceptstore gebruikt POS data
+            is_conceptstore = company_id == 1
             
-            if top_products:
-                df_top = pd.DataFrame(top_products)
-                df_top.columns = ["Product", "Omzet", "Aantal"]
+            if is_conceptstore:
+                st.caption("📍 Data uit POS orders (Conceptstore)")
+                pos_sales = get_pos_product_sales(selected_year, company_id)
                 
+                if pos_sales:
+                    # Aggregeer POS data per product
+                    prod_data = {}
+                    for p in pos_sales:
+                        prod = p.get("product_id")
+                        if prod:
+                            prod_name = prod[1]
+                            if prod_name not in prod_data:
+                                prod_data[prod_name] = {"Omzet": 0, "Aantal": 0}
+                            prod_data[prod_name]["Omzet"] += p.get("price_subtotal", 0)
+                            prod_data[prod_name]["Aantal"] += p.get("qty", 0)
+                    
+                    top_list = sorted(prod_data.items(), key=lambda x: -x[1]["Omzet"])[:20]
+                    df_top = pd.DataFrame([
+                        {"Product": k, "Omzet": v["Omzet"], "Aantal": v["Aantal"]}
+                        for k, v in top_list
+                    ])
+                else:
+                    df_top = pd.DataFrame()
+            else:
+                top_products = get_top_products(selected_year, company_id, limit=20)
+                if top_products:
+                    df_top = pd.DataFrame(top_products)
+                    df_top.columns = ["Product", "Omzet", "Aantal"]
+                else:
+                    df_top = pd.DataFrame()
+            
+            if not df_top.empty:
                 col1, col2 = st.columns([2, 1])
                 
                 with col1:
