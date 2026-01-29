@@ -259,7 +259,7 @@ def odoo_call(model, method, domain, fields, limit=None, timeout=120):
         st.error("⚠️ ODOO_API_KEY niet geconfigureerd in Streamlit Secrets")
         return []
     
-    args = [ODOO_DB, ODOO_UID, ODOO_API_KEY, model, method, domain]
+    args = [ODOO_DB, ODOO_UID, ODOO_API_KEY, model, method, [domain]]
     kwargs = {"fields": fields}
     if limit:
         kwargs["limit"] = limit
