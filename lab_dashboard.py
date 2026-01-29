@@ -1,252 +1,290 @@
 """
-LAB Groep Financial Dashboard v3
+LAB Groep Financial Dashboard v4
 ================================
-Fixed Odoo API calls + Streamlit Secrets
+With cost breakdown details and fixed bank balances
 """
 
 import streamlit as st
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import requests
 from datetime import datetime, timedelta
 import json
 
-try:
-    import plotly.express as px
-    import plotly.graph_objects as go
-except ImportError:
-    st.error("❌ Plotly niet gevonden. Check requirements.txt")
-    st.stop()
-
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
-def get_config():
-    """Get configuration from Streamlit secrets"""
-    try:
-        return {
-            "api_key": st.secrets["ODOO_API_KEY"],
-            "database": st.secrets.get("ODOO_DATABASE", "bluezebra-works-nl-vestingh-production-13415483"),
-            "url": st.secrets.get("ODOO_URL", "https://lab.odoo.works/jsonrpc"),
-            "uid": int(st.secrets.get("ODOO_UID", 37))
-        }
-    except Exception:
-        st.error("""
-        ❌ **Secrets niet geconfigureerd!**
-        
-        Ga naar Streamlit Cloud → Settings → Secrets en voeg toe:
-        ```toml
-        ODOO_API_KEY = "jouw_api_key"
-        ```
-        """)
-        st.stop()
+
+ODOO_URL = "https://lab.odoo.works/jsonrpc"
+ODOO_DB = "bluezebra-works-nl-vestingh-production-13415483"
+ODOO_UID = 37
+
+# Get API key from Streamlit secrets or fallback
+try:
+    ODOO_API_KEY = st.secrets["ODOO_API_KEY"]
+except:
+    ODOO_API_KEY = "9d8d2177b4fa0c228be7be83899de639f21eca98"
 
 COMPANIES = {
-    1: {"name": "LAB Conceptstore B.V.", "short": "Conceptstore", "color": "#1E88E5"},
-    2: {"name": "LAB Shops B.V.", "short": "Shops", "color": "#1565C0"},
-    3: {"name": "LAB Projects B.V.", "short": "Projects", "color": "#0D47A1"}
+    1: "LAB Conceptstore",
+    2: "LAB Shops", 
+    3: "LAB Projects"
+}
+
+COMPANY_COLORS = {
+    "LAB Conceptstore": "#1E88E5",  # Blue
+    "LAB Shops": "#43A047",         # Green
+    "LAB Projects": "#FB8C00"       # Orange
+}
+
+# Cost category mapping (4* accounts)
+COST_CATEGORIES = {
+    "40": "Personeelskosten",
+    "41": "Huisvestingskosten",
+    "42": "Kantoorkosten",
+    "43": "Vervoerskosten",
+    "44": "Marketing & Reclame",
+    "45": "Overige Bedrijfskosten",
+    "46": "Overige Bedrijfskosten",
+    "47": "Financiële Lasten",
+    "48": "Afschrijvingen",
+    "49": "Overige Kosten"
 }
 
 # =============================================================================
-# ODOO API - FIXED
+# ODOO API FUNCTIONS
 # =============================================================================
-@st.cache_data(ttl=300)
-def odoo_search_read(model, domain, fields, limit=None, _config_key=None):
-    """Execute Odoo search_read - FIXED argument structure"""
-    config = get_config()
-    
-    # Build kwargs dict for search_read
-    kwargs = {"fields": fields}
+
+def odoo_call(model, method, domain=None, fields=None, limit=None, order=None):
+    """Generic Odoo JSON-RPC call"""
+    args = [domain or []]
+    kwargs = {}
+    if fields:
+        kwargs["fields"] = fields
     if limit:
         kwargs["limit"] = limit
+    if order:
+        kwargs["order"] = order
     
-    # Correct structure: [db, uid, password, model, method, [args], {kwargs}]
     payload = {
         "jsonrpc": "2.0",
         "method": "call",
         "params": {
             "service": "object",
             "method": "execute_kw",
-            "args": [
-                config["database"],
-                config["uid"],
-                config["api_key"],
-                model,
-                "search_read",
-                [domain],  # domain as first positional arg in list
-                kwargs     # fields, limit as kwargs dict
-            ]
+            "args": [ODOO_DB, ODOO_UID, ODOO_API_KEY, model, method, args, kwargs]
         },
         "id": 1
     }
     
     try:
-        response = requests.post(config["url"], json=payload, timeout=60)
+        response = requests.post(ODOO_URL, json=payload, timeout=30)
         result = response.json()
-        
         if "error" in result:
-            error_msg = result["error"].get("data", {}).get("message", str(result["error"]))
-            st.error(f"Odoo Error: {error_msg}")
+            st.error(f"Odoo Error: {result['error']}")
             return []
-        
         return result.get("result", [])
-    except requests.exceptions.Timeout:
-        st.warning("⏱️ Request timeout - probeer opnieuw")
-        return []
     except Exception as e:
-        st.error(f"Connection Error: {str(e)}")
+        st.error(f"Connection Error: {e}")
         return []
 
 @st.cache_data(ttl=300)
-def odoo_search(model, domain, _config_key=None):
-    """Execute Odoo search - returns IDs only"""
-    config = get_config()
-    
-    payload = {
-        "jsonrpc": "2.0",
-        "method": "call",
-        "params": {
-            "service": "object",
-            "method": "execute_kw",
-            "args": [
-                config["database"],
-                config["uid"],
-                config["api_key"],
-                model,
-                "search",
-                [domain]
-            ]
-        },
-        "id": 1
-    }
-    
-    try:
-        response = requests.post(config["url"], json=payload, timeout=30)
-        result = response.json()
-        if "error" in result:
-            return []
-        return result.get("result", [])
-    except:
-        return []
-
-# =============================================================================
-# DATA FUNCTIONS
-# =============================================================================
-def get_revenue_data(year, company_id=None):
-    """Get revenue from 8* accounts"""
-    domain = [
-        ("account_id.code", "=like", "8%"),
-        ("date", ">=", f"{year}-01-01"),
-        ("date", "<=", f"{year}-12-31"),
-        ("parent_state", "=", "posted")
-    ]
-    if company_id:
-        domain.append(("company_id", "=", company_id))
-    
-    return odoo_search_read(
-        "account.move.line",
-        domain,
-        ["date", "balance", "company_id", "account_id", "name"],
-        limit=15000
-    )
-
-def get_cost_data(year, company_id=None):
-    """Get costs from 4* and 7* accounts (excl 48, 49)"""
-    # Query 4* accounts (excluding 48*, 49*)
-    domain_4 = [
-        ("account_id.code", "=like", "4%"),
-        ("account_id.code", "not like", "48%"),
-        ("account_id.code", "not like", "49%"),
-        ("date", ">=", f"{year}-01-01"),
-        ("date", "<=", f"{year}-12-31"),
-        ("parent_state", "=", "posted")
-    ]
-    if company_id:
-        domain_4.append(("company_id", "=", company_id))
-    
-    # Query 7* accounts
-    domain_7 = [
-        ("account_id.code", "=like", "7%"),
-        ("date", ">=", f"{year}-01-01"),
-        ("date", "<=", f"{year}-12-31"),
-        ("parent_state", "=", "posted")
-    ]
-    if company_id:
-        domain_7.append(("company_id", "=", company_id))
-    
-    costs_4 = odoo_search_read("account.move.line", domain_4, 
-                               ["date", "balance", "company_id", "account_id"], limit=10000)
-    costs_7 = odoo_search_read("account.move.line", domain_7,
-                               ["date", "balance", "company_id", "account_id"], limit=10000)
-    
-    return costs_4 + costs_7
-
 def get_bank_balances():
-    """Get current bank balances per company"""
-    journals = odoo_search_read(
+    """Get all bank account balances"""
+    return odoo_call(
         "account.journal",
-        [("type", "=", "bank")],
-        ["name", "company_id", "current_statement_balance"],
-        limit=20
+        "search_read",
+        [["type", "=", "bank"]],
+        ["name", "company_id", "current_statement_balance", "default_account_id"]
     )
-    return journals
 
+@st.cache_data(ttl=300)
+def get_revenue_data(year):
+    """Get revenue from 8* accounts"""
+    start_date = f"{year}-01-01"
+    end_date = f"{year}-12-31"
+    
+    return odoo_call(
+        "account.move.line",
+        "search_read",
+        [
+            ["date", ">=", start_date],
+            ["date", "<=", end_date],
+            ["account_id.code", "=like", "8%"],
+            ["parent_state", "=", "posted"]
+        ],
+        ["date", "company_id", "account_id", "balance"],
+        limit=50000
+    )
+
+@st.cache_data(ttl=300)
+def get_cost_data(year):
+    """Get costs from 4* and 7* accounts"""
+    start_date = f"{year}-01-01"
+    end_date = f"{year}-12-31"
+    
+    return odoo_call(
+        "account.move.line",
+        "search_read",
+        [
+            ["date", ">=", start_date],
+            ["date", "<=", end_date],
+            ["account_id.code", "=like", "4%"],
+            ["parent_state", "=", "posted"]
+        ],
+        ["date", "company_id", "account_id", "balance", "name"],
+        limit=50000
+    )
+
+@st.cache_data(ttl=300)
+def get_cogs_data(year):
+    """Get COGS from 7* accounts"""
+    start_date = f"{year}-01-01"
+    end_date = f"{year}-12-31"
+    
+    return odoo_call(
+        "account.move.line",
+        "search_read",
+        [
+            ["date", ">=", start_date],
+            ["date", "<=", end_date],
+            ["account_id.code", "=like", "7%"],
+            ["parent_state", "=", "posted"]
+        ],
+        ["date", "company_id", "account_id", "balance"],
+        limit=50000
+    )
+
+@st.cache_data(ttl=300)
 def get_receivables():
     """Get open receivables (excl intercompany)"""
-    # Find LAB partner IDs to exclude
-    lab_partners = odoo_search("res.partner", [("name", "ilike", "LAB%B.V.")])
-    
-    domain = [
-        ("account_id.account_type", "=", "asset_receivable"),
-        ("parent_state", "=", "posted"),
-        ("reconciled", "=", False)
-    ]
-    if lab_partners:
-        domain.append(("partner_id", "not in", lab_partners))
-    
-    return odoo_search_read(
-        "account.move.line",
-        domain,
-        ["balance", "company_id", "partner_id", "date_maturity"],
-        limit=5000
+    return odoo_call(
+        "account.move",
+        "search_read",
+        [
+            ["move_type", "=", "out_invoice"],
+            ["state", "=", "posted"],
+            ["payment_state", "in", ["not_paid", "partial"]]
+        ],
+        ["company_id", "partner_id", "amount_residual"],
+        limit=10000
     )
 
+@st.cache_data(ttl=300)
 def get_payables():
     """Get open payables (excl intercompany)"""
-    lab_partners = odoo_search("res.partner", [("name", "ilike", "LAB%B.V.")])
-    
-    domain = [
-        ("account_id.account_type", "=", "liability_payable"),
-        ("parent_state", "=", "posted"),
-        ("reconciled", "=", False)
-    ]
-    if lab_partners:
-        domain.append(("partner_id", "not in", lab_partners))
-    
-    return odoo_search_read(
-        "account.move.line",
-        domain,
-        ["balance", "company_id", "partner_id", "date_maturity"],
-        limit=5000
+    return odoo_call(
+        "account.move",
+        "search_read",
+        [
+            ["move_type", "=", "in_invoice"],
+            ["state", "=", "posted"],
+            ["payment_state", "in", ["not_paid", "partial"]]
+        ],
+        ["company_id", "partner_id", "amount_residual"],
+        limit=10000
     )
 
-def get_yesterday_sales():
+@st.cache_data(ttl=300)
+def get_yesterday_revenue():
     """Get yesterday's revenue"""
     yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
     
-    return odoo_search_read(
+    return odoo_call(
         "account.move.line",
+        "search_read",
         [
-            ("account_id.code", "=like", "8%"),
-            ("date", "=", yesterday),
-            ("parent_state", "=", "posted")
+            ["date", "=", yesterday],
+            ["account_id.code", "=like", "8%"],
+            ["parent_state", "=", "posted"]
         ],
-        ["balance", "company_id"],
-        limit=1000
+        ["company_id", "balance"]
     )
+
+@st.cache_data(ttl=300)
+def get_account_details():
+    """Get account names for cost breakdown"""
+    return odoo_call(
+        "account.account",
+        "search_read",
+        [["code", "=like", "4%"]],
+        ["code", "name"]
+    )
+
+# =============================================================================
+# DATA PROCESSING
+# =============================================================================
+
+def process_bank_data(bank_data, company_filter=None):
+    """Process bank balances per company"""
+    result = {}
+    
+    # Exclude certain accounts (R/C, payment processors with 0 balance)
+    exclude_names = ["R/C pay.nl"]  # Exclude R/C accounts (intercompany)
+    
+    for bank in bank_data:
+        company_name = bank["company_id"][1] if bank["company_id"] else "Unknown"
+        short_name = company_name.replace(" B.V.", "")
+        
+        if company_filter and company_filter != "Alle" and short_name != company_filter:
+            continue
+        
+        # Skip excluded accounts
+        if any(exc in bank["name"] for exc in exclude_names):
+            continue
+            
+        balance = bank.get("current_statement_balance", 0) or 0
+        
+        if short_name not in result:
+            result[short_name] = {"total": 0, "accounts": []}
+        
+        result[short_name]["total"] += balance
+        result[short_name]["accounts"].append({
+            "name": bank["name"],
+            "balance": balance
+        })
+    
+    return result
+
+def process_cost_breakdown(cost_data, account_details, company_filter=None):
+    """Process costs by category"""
+    # Create account code to name mapping
+    account_map = {acc["code"]: acc["name"] for acc in account_details}
+    
+    categories = {}
+    accounts = {}
+    
+    for line in cost_data:
+        company_name = line["company_id"][1].replace(" B.V.", "") if line["company_id"] else "Unknown"
+        
+        if company_filter and company_filter != "Alle" and company_name != company_filter:
+            continue
+        
+        account_code = line["account_id"][1].split()[0] if line["account_id"] else "0000"
+        account_name = line["account_id"][1] if line["account_id"] else "Unknown"
+        amount = line.get("balance", 0) or 0
+        
+        # Get category from first 2 digits
+        cat_code = account_code[:2]
+        cat_name = COST_CATEGORIES.get(cat_code, f"Overig ({cat_code})")
+        
+        # Aggregate by category
+        if cat_name not in categories:
+            categories[cat_name] = 0
+        categories[cat_name] += amount
+        
+        # Aggregate by specific account
+        if account_name not in accounts:
+            accounts[account_name] = 0
+        accounts[account_name] += amount
+    
+    return categories, accounts
 
 # =============================================================================
 # DASHBOARD UI
 # =============================================================================
+
 def main():
     st.set_page_config(
         page_title="LAB Groep Dashboard",
@@ -254,189 +292,346 @@ def main():
         layout="wide"
     )
     
-    # Custom styling
+    # Custom CSS
     st.markdown("""
     <style>
-    .block-container { padding-top: 2rem; }
-    div[data-testid="metric-container"] {
-        background-color: #f0f2f6;
+    .metric-card {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 20px;
         border-radius: 10px;
+        color: white;
+    }
+    .stMetric > div {
+        background-color: #f8f9fa;
         padding: 15px;
+        border-radius: 8px;
+        border-left: 4px solid #1E88E5;
     }
     </style>
     """, unsafe_allow_html=True)
     
     # Header
     st.title("📊 LAB Groep Financial Dashboard")
-    st.caption("Real-time financiële inzichten uit Odoo")
-    
-    # Validate config
-    config = get_config()
+    st.markdown(f"*Laatste update: {datetime.now().strftime('%d-%m-%Y %H:%M')}*")
     
     # Sidebar filters
     with st.sidebar:
-        st.header("🎛️ Filters")
-        from datetime import datetime
+        st.header("🔍 Filters")
+        
         current_year = datetime.now().year
         selected_year = st.selectbox("📅 Jaar", list(range(current_year, 2022, -1)))
         
-        company_options = {"Alle entiteiten": None}
-        company_options.update({v["name"]: k for k, v in COMPANIES.items()})
-        selected_company_name = st.selectbox("🏢 Entiteit", list(company_options.keys()))
-        company_id = company_options[selected_company_name]
+        company_options = ["Alle"] + list(COMPANIES.values())
+        selected_company = st.selectbox("🏢 Entiteit", company_options)
         
-        st.divider()
-        if st.button("🔄 Ververs Data", use_container_width=True):
+        if st.button("🔄 Ververs Data"):
             st.cache_data.clear()
             st.rerun()
-        
-        st.caption(f"⏰ {datetime.now().strftime('%d-%m-%Y %H:%M')}")
     
-    # Load all data
-    with st.spinner("📡 Data laden..."):
-        revenue_data = get_revenue_data(selected_year, company_id)
-        cost_data = get_cost_data(selected_year, company_id)
+    # ==========================================================================
+    # LOAD DATA
+    # ==========================================================================
+    
+    with st.spinner("Data laden uit Odoo..."):
         bank_data = get_bank_balances()
+        revenue_data = get_revenue_data(selected_year)
+        cost_data = get_cost_data(selected_year)
+        cogs_data = get_cogs_data(selected_year)
         receivables = get_receivables()
         payables = get_payables()
-        yesterday_sales = get_yesterday_sales()
+        yesterday_data = get_yesterday_revenue()
+        account_details = get_account_details()
     
-    # Calculate KPIs
-    total_revenue = abs(sum(r.get("balance", 0) for r in revenue_data))
-    total_costs = sum(c.get("balance", 0) for c in cost_data)
-    result = total_revenue - total_costs
-    margin_pct = (result / total_revenue * 100) if total_revenue > 0 else 0
+    # ==========================================================================
+    # PROCESS DATA
+    # ==========================================================================
     
-    total_bank = sum(b.get("current_balance", 0) for b in bank_data)
-    total_receivables = sum(r.get("balance", 0) for r in receivables)
-    total_payables = abs(sum(p.get("balance", 0) for p in payables))
-    yesterday_total = abs(sum(s.get("balance", 0) for s in yesterday_sales))
+    # Bank balances
+    bank_by_company = process_bank_data(bank_data, selected_company)
+    total_bank = sum(comp["total"] for comp in bank_by_company.values())
     
-    # KPI Cards
-    st.subheader("📈 Key Performance Indicators")
+    # Revenue
+    total_revenue = 0
+    revenue_by_company = {}
+    for line in revenue_data:
+        company = line["company_id"][1].replace(" B.V.", "") if line["company_id"] else "Unknown"
+        if selected_company != "Alle" and company != selected_company:
+            continue
+        amount = abs(line.get("balance", 0) or 0)
+        total_revenue += amount
+        revenue_by_company[company] = revenue_by_company.get(company, 0) + amount
+    
+    # Costs (4*)
+    total_costs_4 = 0
+    for line in cost_data:
+        company = line["company_id"][1].replace(" B.V.", "") if line["company_id"] else "Unknown"
+        if selected_company != "Alle" and company != selected_company:
+            continue
+        total_costs_4 += line.get("balance", 0) or 0
+    
+    # COGS (7*)
+    total_cogs = 0
+    for line in cogs_data:
+        company = line["company_id"][1].replace(" B.V.", "") if line["company_id"] else "Unknown"
+        if selected_company != "Alle" and company != selected_company:
+            continue
+        total_cogs += line.get("balance", 0) or 0
+    
+    total_costs = total_costs_4 + total_cogs
+    
+    # Receivables & Payables
+    ic_partners = ["LAB Conceptstore", "LAB Shops", "LAB Projects"]
+    
+    total_receivables = 0
+    for inv in receivables:
+        company = inv["company_id"][1].replace(" B.V.", "") if inv["company_id"] else "Unknown"
+        partner = inv["partner_id"][1] if inv["partner_id"] else ""
+        if selected_company != "Alle" and company != selected_company:
+            continue
+        if not any(ic in partner for ic in ic_partners):
+            total_receivables += inv.get("amount_residual", 0) or 0
+    
+    total_payables = 0
+    for inv in payables:
+        company = inv["company_id"][1].replace(" B.V.", "") if inv["company_id"] else "Unknown"
+        partner = inv["partner_id"][1] if inv["partner_id"] else ""
+        if selected_company != "Alle" and company != selected_company:
+            continue
+        if not any(ic in partner for ic in ic_partners):
+            total_payables += inv.get("amount_residual", 0) or 0
+    
+    # Yesterday
+    yesterday_revenue = 0
+    for line in yesterday_data:
+        company = line["company_id"][1].replace(" B.V.", "") if line["company_id"] else "Unknown"
+        if selected_company != "Alle" and company != selected_company:
+            continue
+        yesterday_revenue += abs(line.get("balance", 0) or 0)
+    
+    # Cost breakdown
+    cost_categories, cost_accounts = process_cost_breakdown(cost_data, account_details, selected_company)
+    
+    # ==========================================================================
+    # KPI CARDS
+    # ==========================================================================
+    
+    st.markdown("### 📈 Key Performance Indicators")
+    
     col1, col2, col3, col4, col5 = st.columns(5)
     
-    col1.metric("💰 Omzet YTD", f"€{total_revenue/1000:,.0f}K")
-    col2.metric("📉 Kosten YTD", f"€{total_costs/1000:,.0f}K")
-    col3.metric("📊 Resultaat", f"€{result/1000:,.0f}K", f"{margin_pct:.1f}%")
-    col4.metric("🏦 Bank", f"€{total_bank/1000:,.0f}K")
-    col5.metric("📅 Gisteren", f"€{yesterday_total/1000:,.1f}K")
+    with col1:
+        st.metric("💰 Omzet YTD", f"€{total_revenue:,.0f}".replace(",", "."))
+    
+    with col2:
+        st.metric("📉 Kosten YTD", f"€{total_costs:,.0f}".replace(",", "."))
+    
+    with col3:
+        result = total_revenue - total_costs
+        margin = (result / total_revenue * 100) if total_revenue > 0 else 0
+        st.metric("📊 Resultaat", f"€{result:,.0f}".replace(",", "."), f"{margin:.1f}%")
+    
+    with col4:
+        st.metric("🏦 Banksaldo", f"€{total_bank:,.0f}".replace(",", "."))
+    
+    with col5:
+        st.metric("📅 Gisteren", f"€{yesterday_revenue:,.0f}".replace(",", "."))
     
     st.divider()
     
-    # Two columns layout
-    left_col, right_col = st.columns([2, 1])
+    # ==========================================================================
+    # BALANCE OVERVIEW
+    # ==========================================================================
     
-    with left_col:
-        st.subheader("📊 Omzet vs Kosten per Maand")
-        
-        if revenue_data:
-            # Process monthly data
-            df_rev = pd.DataFrame(revenue_data)
-            df_cost = pd.DataFrame(cost_data) if cost_data else pd.DataFrame()
-            
-            if "date" in df_rev.columns:
-                df_rev["month"] = pd.to_datetime(df_rev["date"]).dt.strftime("%Y-%m")
-                monthly_rev = df_rev.groupby("month")["balance"].sum().abs()
-                
-                if not df_cost.empty and "date" in df_cost.columns:
-                    df_cost["month"] = pd.to_datetime(df_cost["date"]).dt.strftime("%Y-%m")
-                    monthly_cost = df_cost.groupby("month")["balance"].sum()
-                else:
-                    monthly_cost = pd.Series(dtype=float)
-                
-                # Combine into chart data
-                months = sorted(set(monthly_rev.index) | set(monthly_cost.index))
-                chart_data = pd.DataFrame({
-                    "Maand": months,
-                    "Omzet": [monthly_rev.get(m, 0) for m in months],
-                    "Kosten": [monthly_cost.get(m, 0) for m in months]
-                })
-                
-                fig = go.Figure()
-                fig.add_trace(go.Bar(name="Omzet", x=chart_data["Maand"], y=chart_data["Omzet"], 
-                                    marker_color="#4CAF50"))
-                fig.add_trace(go.Bar(name="Kosten", x=chart_data["Maand"], y=chart_data["Kosten"],
-                                    marker_color="#1565C0"))
-                fig.update_layout(barmode="group", height=400, 
-                                 legend=dict(orientation="h", yanchor="bottom", y=1.02))
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("Geen data beschikbaar")
-        else:
-            st.info("Geen data beschikbaar")
-    
-    with right_col:
-        st.subheader("💳 Werkkapitaal")
-        
-        for comp_id, comp_info in COMPANIES.items():
-            comp_bank = sum(b.get("current_balance", 0) for b in bank_data 
-                          if b.get("company_id") and b["company_id"][0] == comp_id)
-            comp_recv = sum(r.get("balance", 0) for r in receivables 
-                          if r.get("company_id") and r["company_id"][0] == comp_id)
-            comp_pay = abs(sum(p.get("balance", 0) for p in payables 
-                             if p.get("company_id") and p["company_id"][0] == comp_id))
-            net = comp_bank + comp_recv - comp_pay
-            
-            status = "🟢" if net >= 0 else "🔴"
-            
-            with st.container():
-                st.markdown(f"**{status} {comp_info['short']}**")
-                cols = st.columns(3)
-                cols[0].caption(f"🏦 €{comp_bank/1000:.0f}K")
-                cols[1].caption(f"📥 €{comp_recv/1000:.0f}K")
-                cols[2].caption(f"📤 €{comp_pay/1000:.0f}K")
-                st.caption(f"Netto: €{net/1000:,.0f}K")
-                st.divider()
-    
-    # Entity comparison
-    st.subheader("🏢 Vergelijking per Entiteit")
-    
-    entity_data = []
-    for comp_id, comp_info in COMPANIES.items():
-        rev = abs(sum(r.get("balance", 0) for r in revenue_data 
-                    if r.get("company_id") and r["company_id"][0] == comp_id))
-        cost = sum(c.get("balance", 0) for c in cost_data 
-                  if c.get("company_id") and c["company_id"][0] == comp_id)
-        entity_data.append({
-            "Entiteit": comp_info["short"],
-            "Omzet": rev,
-            "Kosten": cost,
-            "Resultaat": rev - cost,
-            "Marge %": f"{((rev-cost)/rev*100):.1f}%" if rev > 0 else "0%"
-        })
-    
-    df_entity = pd.DataFrame(entity_data)
+    st.markdown("### 💳 Balansoverzicht")
     
     col1, col2 = st.columns(2)
     
     with col1:
-        fig = px.bar(df_entity, x="Entiteit", y=["Omzet", "Kosten"], 
-                    barmode="group", color_discrete_sequence=["#4CAF50", "#1565C0"])
-        fig.update_layout(height=350, legend=dict(orientation="h", y=1.1))
-        st.plotly_chart(fig, use_container_width=True)
+        # Bank details per company
+        st.markdown("#### 🏦 Bankrekeningen")
+        
+        for company, data in sorted(bank_by_company.items()):
+            with st.expander(f"**{company}**: €{data['total']:,.2f}".replace(",", ".")):
+                for acc in sorted(data["accounts"], key=lambda x: -x["balance"]):
+                    if acc["balance"] != 0:
+                        color = "green" if acc["balance"] > 0 else "red"
+                        st.markdown(f"- {acc['name']}: <span style='color:{color}'>€{acc['balance']:,.2f}</span>".replace(",", "."), unsafe_allow_html=True)
     
     with col2:
-        fig = px.pie(df_entity, values="Omzet", names="Entiteit",
-                    color_discrete_sequence=["#1E88E5", "#1565C0", "#0D47A1"])
-        fig.update_layout(height=350)
-        st.plotly_chart(fig, use_container_width=True)
+        # Receivables & Payables
+        st.markdown("#### 📊 Vorderingen & Schulden")
+        
+        bal_col1, bal_col2 = st.columns(2)
+        with bal_col1:
+            st.metric("📥 Debiteuren", f"€{total_receivables:,.0f}".replace(",", "."))
+        with bal_col2:
+            st.metric("📤 Crediteuren", f"€{total_payables:,.0f}".replace(",", "."))
+        
+        # Working capital
+        working_capital = total_bank + total_receivables - total_payables
+        wc_color = "green" if working_capital > 0 else "red"
+        st.markdown(f"**Netto Werkkapitaal:** <span style='color:{wc_color}; font-size:24px'>€{working_capital:,.0f}</span>".replace(",", "."), unsafe_allow_html=True)
     
-    # Data table
-    with st.expander("📋 Details per Entiteit"):
-        st.dataframe(
-            df_entity.style.format({
-                "Omzet": "€{:,.0f}",
-                "Kosten": "€{:,.0f}",
-                "Resultaat": "€{:,.0f}"
-            }),
-            use_container_width=True,
-            hide_index=True
-        )
-    
-    # Footer
     st.divider()
-    st.caption("📊 LAB Groep Dashboard | Data: Odoo | Built with Streamlit")
+    
+    # ==========================================================================
+    # COST BREAKDOWN
+    # ==========================================================================
+    
+    st.markdown("### 💸 Kostenanalyse")
+    
+    tab1, tab2, tab3 = st.tabs(["📊 Per Categorie", "📋 Top Kostenposten", "📈 Trend"])
+    
+    with tab1:
+        if cost_categories:
+            # Sort and prepare data
+            sorted_cats = sorted(cost_categories.items(), key=lambda x: -x[1])
+            
+            df_cats = pd.DataFrame(sorted_cats, columns=["Categorie", "Bedrag"])
+            df_cats = df_cats[df_cats["Bedrag"] > 0]  # Only positive costs
+            
+            col1, col2 = st.columns([2, 1])
+            
+            with col1:
+                # Horizontal bar chart
+                fig = px.bar(
+                    df_cats,
+                    x="Bedrag",
+                    y="Categorie",
+                    orientation="h",
+                    color="Bedrag",
+                    color_continuous_scale=["#90CAF9", "#1565C0"],
+                    title="Kosten per Categorie (4* rekeningen)"
+                )
+                fig.update_layout(
+                    showlegend=False,
+                    height=400,
+                    yaxis=dict(categoryorder="total ascending")
+                )
+                fig.update_traces(texttemplate="€%{x:,.0f}", textposition="outside")
+                st.plotly_chart(fig, use_container_width=True)
+            
+            with col2:
+                # Summary table
+                st.markdown("**Samenvatting:**")
+                for cat, amount in sorted_cats[:8]:
+                    if amount > 0:
+                        pct = amount / sum(c[1] for c in sorted_cats if c[1] > 0) * 100
+                        st.markdown(f"- **{cat}**: €{amount:,.0f} ({pct:.1f}%)".replace(",", "."))
+    
+    with tab2:
+        if cost_accounts:
+            # Top 15 cost accounts
+            sorted_accounts = sorted(cost_accounts.items(), key=lambda x: -x[1])[:15]
+            
+            df_accounts = pd.DataFrame(sorted_accounts, columns=["Grootboek", "Bedrag"])
+            df_accounts = df_accounts[df_accounts["Bedrag"] > 0]
+            
+            fig = px.bar(
+                df_accounts,
+                x="Bedrag",
+                y="Grootboek",
+                orientation="h",
+                color_discrete_sequence=["#42A5F5"],
+                title="Top 15 Kostenposten (4* rekeningen)"
+            )
+            fig.update_layout(
+                height=500,
+                yaxis=dict(categoryorder="total ascending")
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Export option
+            if st.button("📥 Download Kostendetail"):
+                csv = df_accounts.to_csv(index=False)
+                st.download_button(
+                    "Download CSV",
+                    csv,
+                    "lab_kosten_detail.csv",
+                    "text/csv"
+                )
+    
+    with tab3:
+        # Monthly trend
+        if cost_data:
+            monthly_costs = {}
+            for line in cost_data:
+                company = line["company_id"][1].replace(" B.V.", "") if line["company_id"] else "Unknown"
+                if selected_company != "Alle" and company != selected_company:
+                    continue
+                
+                date = line.get("date", "")
+                if date:
+                    month = date[:7]  # YYYY-MM
+                    amount = line.get("balance", 0) or 0
+                    monthly_costs[month] = monthly_costs.get(month, 0) + amount
+            
+            if monthly_costs:
+                df_trend = pd.DataFrame(
+                    sorted(monthly_costs.items()),
+                    columns=["Maand", "Kosten"]
+                )
+                
+                fig = px.line(
+                    df_trend,
+                    x="Maand",
+                    y="Kosten",
+                    markers=True,
+                    title="Maandelijkse Kostenontwikkeling"
+                )
+                fig.update_traces(line_color="#1E88E5", line_width=3)
+                st.plotly_chart(fig, use_container_width=True)
+    
+    st.divider()
+    
+    # ==========================================================================
+    # REVENUE BY ENTITY
+    # ==========================================================================
+    
+    st.markdown("### 🏢 Omzet per Entiteit")
+    
+    if revenue_by_company and selected_company == "Alle":
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            df_rev = pd.DataFrame(
+                [(k, v) for k, v in revenue_by_company.items()],
+                columns=["Entiteit", "Omzet"]
+            )
+            
+            fig = px.pie(
+                df_rev,
+                values="Omzet",
+                names="Entiteit",
+                color="Entiteit",
+                color_discrete_map=COMPANY_COLORS,
+                title="Omzetverdeling"
+            )
+            fig.update_traces(textinfo="percent+label")
+            st.plotly_chart(fig, use_container_width=True)
+        
+        with col2:
+            fig = px.bar(
+                df_rev,
+                x="Entiteit",
+                y="Omzet",
+                color="Entiteit",
+                color_discrete_map=COMPANY_COLORS,
+                title="Omzet per Entiteit"
+            )
+            fig.update_traces(texttemplate="€%{y:,.0f}", textposition="outside")
+            st.plotly_chart(fig, use_container_width=True)
+    
+    # ==========================================================================
+    # FOOTER
+    # ==========================================================================
+    
+    st.divider()
+    st.markdown("""
+    <div style='text-align: center; color: #666; font-size: 12px;'>
+    📊 LAB Groep Financial Dashboard | Data uit Odoo | Gebouwd met ❤️ door Tasklet
+    </div>
+    """, unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
