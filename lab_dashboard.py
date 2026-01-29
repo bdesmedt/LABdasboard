@@ -507,9 +507,20 @@ def get_product_sales(year, company_id=None):
     return odoo_call(
         "account.move.line", "search_read",
         domain,
-        ["product_id", "product_categ_id", "price_subtotal", "quantity", "company_id"],
+        ["product_id", "price_subtotal", "quantity", "company_id"],
         limit=10000
     )
+
+@st.cache_data(ttl=300)
+def get_product_categories():
+    """Haal alle producten op met hun categorie"""
+    products = odoo_call(
+        "product.product", "search_read",
+        [],
+        ["id", "name", "categ_id"],
+        limit=5000
+    )
+    return {p["id"]: p.get("categ_id", [None, "Onbekend"]) for p in products}
 
 @st.cache_data(ttl=300)
 def get_top_products(year, company_id=None, limit=20):
@@ -1051,14 +1062,17 @@ def main():
             st.subheader("📦 Omzet per Productcategorie")
             
             product_sales = get_product_sales(selected_year, company_id)
+            product_cats = get_product_categories()
             
             if product_sales:
                 # Groepeer per categorie
                 cat_data = {}
                 for p in product_sales:
-                    cat = p.get("product_categ_id")
-                    if cat:
-                        cat_name = cat[1]
+                    prod = p.get("product_id")
+                    if prod:
+                        prod_id = prod[0]
+                        cat = product_cats.get(prod_id, [None, "Onbekend"])
+                        cat_name = cat[1] if cat else "Onbekend"
                         if cat_name not in cat_data:
                             cat_data[cat_name] = {"Omzet": 0, "Aantal": 0}
                         cat_data[cat_name]["Omzet"] += p.get("price_subtotal", 0)
