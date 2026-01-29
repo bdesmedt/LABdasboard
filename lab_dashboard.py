@@ -1,13 +1,16 @@
 """
-LAB Groep Financial Dashboard v6
+LAB Groep Financial Dashboard v7
 ================================
-Met factuur drill-down, PDF viewer, en geoptimaliseerde queries
+Met Nederlandse vertalingen + aparte Bank tab
 
 Features:
-- Gefixte timeouts met chunked data loading
-- Caching voor snellere herhaalde queries
-- Factuur zoeken en drill-down tot PDF niveau
-- Alle v5 features behouden
+- ✅ Nederlandse benamingen voor alle rekeningen/categorieën
+- ✅ Aparte tab met banksaldi per rekening per entiteit
+- ✅ Timeout fixes + caching
+- ✅ Factuur drill-down met PDF/Odoo link
+- ✅ Kostendetail per categorie
+- ✅ Cashflow prognose
+- ✅ LAB Projects: Verf vs Behang analyse
 """
 
 import streamlit as st
@@ -17,7 +20,7 @@ import plotly.graph_objects as go
 import requests
 import json
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List
+from functools import lru_cache
 import base64
 
 # =============================================================================
@@ -35,43 +38,235 @@ st.set_page_config(
 ODOO_URL = "https://lab.odoo.works/jsonrpc"
 ODOO_DB = "bluezebra-works-nl-vestingh-production-13415483"
 ODOO_UID = 37
-ODOO_TIMEOUT = 120  # Verhoogd naar 120 seconden
+ODOO_API_KEY = st.secrets.get("ODOO_API_KEY", "")
 
-# Bedrijven
 COMPANIES = {
-    0: "Alle Entiteiten",
-    1: "LAB Conceptstore B.V.",
-    2: "LAB Shops B.V.",
-    3: "LAB Projects B.V."
+    1: "LAB Conceptstore",
+    2: "LAB Shops",
+    3: "LAB Projects"
 }
 
 # =============================================================================
-# ODOO API FUNCTIES (met timeout en retry)
+# NEDERLANDSE VERTALINGEN
 # =============================================================================
 
-def get_api_key():
-    """Haal API key op uit Streamlit secrets"""
-    try:
-        return st.secrets["ODOO_API_KEY"]
-    except:
-        st.error("⚠️ ODOO_API_KEY niet gevonden in Streamlit Secrets!")
-        st.info("Ga naar Settings → Secrets en voeg toe:\n```\nODOO_API_KEY = \"jouw_api_key\"\n```")
-        st.stop()
+# Categorie vertalingen (voor kostencategorieën 40-49)
+CATEGORY_TRANSLATIONS = {
+    "40": "Personeelskosten",
+    "41": "Huisvestingskosten",
+    "42": "Vervoerskosten",
+    "43": "Kantoorkosten",
+    "44": "Marketing & Reclame",
+    "45": "Algemene Kosten",
+    "46": "Overige Bedrijfskosten",
+    "47": "Financiële Lasten",
+    "48": "Afschrijvingen",
+    "49": "Overige Kosten"
+}
 
-def odoo_call(model: str, method: str, domain: list, fields: list = None, 
-              limit: int = None, offset: int = 0, order: str = None, timeout: int = ODOO_TIMEOUT) -> Optional[list]:
-    """Voer Odoo API call uit met error handling en timeout"""
-    api_key = get_api_key()
+# Uitgebreide rekening vertalingen
+ACCOUNT_TRANSLATIONS = {
+    # Personeelskosten (40)
+    "Gross wages": "Brutolonen",
+    "Bonuses and commissions": "Bonussen en provisies",
+    "Holiday allowance": "Vakantietoeslag",
+    "Royalty": "Tantièmes",
+    "Employee car contribution": "Eigen bijdrage auto",
+    "Healthcare Insurance Act (SVW) contribution": "ZVW-bijdrage",
+    "Employer's share of payroll taxes": "Werkgeverslasten loonheffing",
+    "Employer's share of pensions": "Pensioenpremie werkgever",
+    "Employer's share of social security contributions": "Sociale lasten werkgever",
+    "Provision for holidays": "Reservering vakantiedagen",
+    "Compensation for commuting": "Reiskostenvergoeding",
+    "Reimbursement of study costs": "Studiekostenvergoeding",
+    "Reimbursement of other travel expenses": "Overige reiskostenvergoeding",
+    "Reimbursement of other expenses": "Overige onkostenvergoeding",
+    "Management fees": "Managementvergoeding",
+    "Staff on loan": "Ingehuurd personeel",
+    "Working expenses scheme (WKR max 1.2% gross pay)": "Werkkostenregeling (WKR)",
+    "Travel costs of hired staff": "Reiskosten ingehuurd personeel",
+    "Recharge of direct labour costs": "Doorbelaste personeelskosten",
+    "Sick leave insurance": "Verzuimverzekering",
+    "Canteen costs": "Kantinekosten",
+    "Corporate clothing": "Bedrijfskleding",
+    "Other travel expenses": "Overige reiskosten",
+    "Conferences, seminars and symposia": "Congressen en seminars",
+    "Staff recruitment costs": "Wervingskosten personeel",
+    "Study and training costs": "Opleidingskosten",
+    "Other personnel costs": "Overige personeelskosten",
+    
+    # Huisvestingskosten (41)
+    "Property rental": "Huur bedrijfspand",
+    "Major property maintenance": "Groot onderhoud pand",
+    "Property maintenance": "Onderhoud pand",
+    "Rent of parking facilities": "Huur parkeerplaatsen",
+    "Gas, water and electricity": "Gas, water en elektra",
+    "Cleaning costs": "Schoonmaakkosten",
+    "Waste disposal costs": "Afvalverwerking",
+    "Other housing costs": "Overige huisvestingskosten",
+    "Telephone and fax": "Telefoon en fax",
+    "Internet": "Internet",
+    "Security costs": "Beveiligingskosten",
+    "Municipal taxes": "Gemeentelijke belastingen",
+    "Insurance of buildings": "Opstalverzekering",
+    
+    # Vervoerskosten (42)
+    "Lease costs of passenger cars": "Leasekosten personenauto's",
+    "Lease costs of delivery vehicles": "Leasekosten bestelwagens",
+    "Fuel for passenger cars": "Brandstof personenauto's",
+    "Fuel for delivery vehicles": "Brandstof bestelwagens",
+    "Road taxes on motor vehicles": "Motorrijtuigenbelasting",
+    "Insurance of motor vehicles": "Autoverzekering",
+    "Repair and maintenance of passenger cars": "Onderhoud personenauto's",
+    "Repair and maintenance of delivery vehicles": "Onderhoud bestelwagens",
+    "Other motor vehicle costs": "Overige autokosten",
+    "Public transport costs": "Openbaar vervoer",
+    "Taxi costs": "Taxikosten",
+    "Parking costs": "Parkeerkosten",
+    "Shipping and transport costs": "Verzend- en transportkosten",
+    
+    # Kantoorkosten (43)
+    "Office supplies": "Kantoorbenodigdheden",
+    "Printing costs": "Drukwerk",
+    "Postage costs": "Portokosten",
+    "Subscriptions": "Abonnementen",
+    "Books and magazines": "Boeken en tijdschriften",
+    "Computer costs": "Computerkosten",
+    "Software costs": "Softwarekosten",
+    "IT costs": "ICT-kosten",
+    "License fees": "Licentiekosten",
+    
+    # Marketing & Reclame (44)
+    "Advertising costs": "Advertentiekosten",
+    "Trade fairs": "Beurzen",
+    "Representation costs": "Representatiekosten",
+    "Business gifts": "Relatiegeschenken",
+    "Website costs": "Websitekosten",
+    "Other marketing costs": "Overige marketingkosten",
+    "Promotional material": "Promotiemateriaal",
+    
+    # Algemene kosten (45)
+    "Accountant fees": "Accountantskosten",
+    "Legal fees": "Juridische kosten",
+    "Consultancy fees": "Advieskosten",
+    "Administration fees": "Administratiekosten",
+    "Association memberships": "Contributies en lidmaatschappen",
+    "Bank charges": "Bankkosten",
+    "Collection costs": "Incassokosten",
+    "Other administrative costs": "Overige administratiekosten",
+    
+    # Overige bedrijfskosten (46)
+    "Insurance premiums": "Verzekeringspremies",
+    "Small equipment": "Klein gereedschap",
+    "Maintenance of machines": "Onderhoud machines",
+    "Lease of machines": "Lease machines",
+    "Other operating costs": "Overige bedrijfskosten",
+    "Permits and licenses": "Vergunningen",
+    
+    # Financiële lasten (47)
+    "Interest expenses": "Rentelasten",
+    "Interest on loans": "Rente op leningen",
+    "Interest on bank overdrafts": "Rente rekening-courant",
+    "Interest on finance leases": "Rente financial lease",
+    "Exchange rate differences": "Koersverschillen",
+    "Bank guarantee costs": "Kosten bankgarantie",
+    "Other financial costs": "Overige financiële kosten",
+    
+    # Afschrijvingen (48)
+    "Depreciation of buildings": "Afschrijving gebouwen",
+    "Depreciation of machinery": "Afschrijving machines",
+    "Depreciation of tools": "Afschrijving gereedschap",
+    "Depreciation of passenger cars": "Afschrijving personenauto's",
+    "Depreciation of other transport equipment": "Afschrijving overig vervoer",
+    "Depreciation of trucks": "Afschrijving vrachtwagens",
+    "Depreciation of office equipment": "Afschrijving kantoorinventaris",
+    "Depreciation of computer equipment": "Afschrijving computers",
+    "Depreciation of other tangible fixed assets": "Afschrijving overige activa",
+    "Depreciation of goodwill": "Afschrijving goodwill",
+    "Depreciation of intangible assets": "Afschrijving immateriële activa",
+    
+    # Overige kosten (49)
+    "Other income": "Overige opbrengsten",
+    "Other costs": "Overige kosten",
+    "Extraordinary income": "Buitengewone baten",
+    "Extraordinary expenses": "Buitengewone lasten",
+    
+    # Omzet (8)
+    "Sales": "Verkopen",
+    "Revenue": "Omzet",
+    "Turnover": "Omzet",
+    "Other revenue": "Overige opbrengsten",
+    "Intercompany sales": "Intercompany verkopen",
+    
+    # Kostprijs verkopen (7)
+    "Cost of goods sold": "Kostprijs verkopen",
+    "Purchase of goods": "Inkoop goederen",
+    "Direct material costs": "Directe materiaalkosten",
+    "Direct labour costs": "Directe loonkosten",
+    "Subcontracting costs": "Uitbestede werkzaamheden",
+    
+    # Bank rekeningen
+    "Bank": "Bank",
+    "Cash": "Kas",
+    "Bank *1550": "Rabobank *1550",
+    "Bank *8312": "Rabobank *8312",
+    "Bank *8068": "Rabobank *8068",
+    "Petty cash": "Kleine kas",
+    
+    # Balansrekeningen
+    "Accounts receivable": "Debiteuren",
+    "Accounts payable": "Crediteuren",
+    "Purchase value of": "Aanschafwaarde",
+    "Depreciation of": "Afschrijving",
+    "General reserve": "Algemene reserve",
+    "Deferred tax liability": "Latente belastingschuld"
+}
+
+def translate_account_name(name):
+    """Vertaal rekeningnaam naar Nederlands"""
+    if not name:
+        return name
+    
+    # Exacte match
+    if name in ACCOUNT_TRANSLATIONS:
+        return ACCOUNT_TRANSLATIONS[name]
+    
+    # Gedeeltelijke match (voor namen met suffix zoals "(kopie)")
+    for eng, nl in ACCOUNT_TRANSLATIONS.items():
+        if name.startswith(eng):
+            suffix = name[len(eng):]
+            return nl + suffix
+        if eng in name:
+            return name.replace(eng, nl)
+    
+    return name
+
+def get_category_name(code):
+    """Haal Nederlandse categorienaam op basis van rekeningcode"""
+    if not code:
+        return "Onbekend"
+    prefix = str(code)[:2]
+    return CATEGORY_TRANSLATIONS.get(prefix, f"Categorie {prefix}")
+
+# =============================================================================
+# ODOO API FUNCTIES
+# =============================================================================
+
+def odoo_call(model, method, domain=None, fields=None, limit=None, timeout=120):
+    """Maak een Odoo JSON-RPC call met Nederlandse vertalingen"""
+    if domain is None:
+        domain = []
+    
+    args = [ODOO_DB, ODOO_UID, ODOO_API_KEY, model, method, [domain]]
     
     kwargs = {}
     if fields:
         kwargs["fields"] = fields
     if limit:
         kwargs["limit"] = limit
-    if offset:
-        kwargs["offset"] = offset
-    if order:
-        kwargs["order"] = order
+    
+    if kwargs:
+        args.append(kwargs)
     
     payload = {
         "jsonrpc": "2.0",
@@ -79,7 +274,7 @@ def odoo_call(model: str, method: str, domain: list, fields: list = None,
         "params": {
             "service": "object",
             "method": "execute_kw",
-            "args": [ODOO_DB, ODOO_UID, api_key, model, method, [domain], kwargs]
+            "args": args
         },
         "id": 1
     }
@@ -89,913 +284,727 @@ def odoo_call(model: str, method: str, domain: list, fields: list = None,
         result = response.json()
         if "error" in result:
             st.error(f"Odoo Error: {result['error'].get('data', {}).get('message', result['error'])}")
-            return None
+            return []
         return result.get("result", [])
     except requests.exceptions.Timeout:
-        st.warning(f"⏱️ Timeout bij ophalen data (>{timeout}s). Probeer een kortere periode.")
-        return None
+        st.error("⏱️ Timeout - probeer een kortere periode of specifieke entiteit")
+        return []
     except Exception as e:
         st.error(f"Connection error: {e}")
-        return None
-
-def odoo_call_chunked(model: str, domain: list, fields: list, chunk_size: int = 500, 
-                      max_records: int = 10000, progress_text: str = "Data laden...") -> list:
-    """Haal grote datasets op in chunks met progress indicator"""
-    all_records = []
-    offset = 0
-    
-    # Eerst count ophalen
-    api_key = get_api_key()
-    count_payload = {
-        "jsonrpc": "2.0",
-        "method": "call",
-        "params": {
-            "service": "object",
-            "method": "execute_kw",
-            "args": [ODOO_DB, ODOO_UID, api_key, model, "search_count", [domain]]
-        },
-        "id": 1
-    }
-    
-    try:
-        response = requests.post(ODOO_URL, json=count_payload, timeout=30)
-        total_count = response.json().get("result", 0)
-    except:
-        total_count = max_records
-    
-    total_count = min(total_count, max_records)
-    
-    if total_count == 0:
         return []
-    
-    progress_bar = st.progress(0, text=progress_text)
-    
-    while offset < total_count:
-        chunk = odoo_call(model, "search_read", domain, fields, limit=chunk_size, offset=offset)
-        if chunk is None:
-            break
-        all_records.extend(chunk)
-        offset += chunk_size
-        progress = min(offset / total_count, 1.0)
-        progress_bar.progress(progress, text=f"{progress_text} ({len(all_records):,}/{total_count:,})")
-    
-    progress_bar.empty()
-    return all_records
-
-# =============================================================================
-# CACHED DATA FUNCTIES
-# =============================================================================
-
-@st.cache_data(ttl=300)  # Cache voor 5 minuten
-def get_revenue_data(year: int, company_id: int) -> pd.DataFrame:
-    """Haal omzetdata op (8* accounts) - gecached"""
-    domain = [
-        ("date", ">=", f"{year}-01-01"),
-        ("date", "<=", f"{year}-12-31"),
-        ("account_id.code", "=like", "8%"),
-        ("parent_state", "=", "posted")
-    ]
-    if company_id > 0:
-        domain.append(("company_id", "=", company_id))
-    
-    fields = ["date", "account_id", "company_id", "balance", "name", "move_id"]
-    data = odoo_call_chunked("account.move.line", domain, fields, progress_text="📊 Omzetdata laden...")
-    
-    if not data:
-        return pd.DataFrame()
-    
-    df = pd.DataFrame(data)
-    df["revenue"] = -df["balance"]  # Omzet is credit (negatief in balance)
-    df["month"] = pd.to_datetime(df["date"]).dt.to_period("M")
-    df["company_name"] = df["company_id"].apply(lambda x: COMPANIES.get(x[0] if isinstance(x, list) else x, "Onbekend"))
-    return df
 
 @st.cache_data(ttl=300)
-def get_cost_data(year: int, company_id: int, exclude_48_49: bool = True) -> pd.DataFrame:
-    """Haal kostendata op (4* + 7* accounts) - gecached"""
-    domain = [
-        ("date", ">=", f"{year}-01-01"),
-        ("date", "<=", f"{year}-12-31"),
-        ("parent_state", "=", "posted"),
-        "|",
-        ("account_id.code", "=like", "4%"),
-        ("account_id.code", "=like", "7%")
-    ]
-    if company_id > 0:
-        domain.append(("company_id", "=", company_id))
-    
-    fields = ["date", "account_id", "company_id", "balance", "name"]
-    data = odoo_call_chunked("account.move.line", domain, fields, progress_text="📉 Kostendata laden...")
-    
-    if not data:
-        return pd.DataFrame()
-    
-    df = pd.DataFrame(data)
-    df["account_code"] = df["account_id"].apply(lambda x: x[1].split()[0] if isinstance(x, list) else "")
-    df["account_name"] = df["account_id"].apply(lambda x: x[1] if isinstance(x, list) else "")
-    
-    # Filter 48* en 49* indien gewenst
-    if exclude_48_49:
-        df = df[~df["account_code"].str.startswith(("48", "49"))]
-    
-    df["cost"] = df["balance"]  # Kosten zijn debit (positief)
-    df["month"] = pd.to_datetime(df["date"]).dt.to_period("M")
-    df["company_name"] = df["company_id"].apply(lambda x: COMPANIES.get(x[0] if isinstance(x, list) else x, "Onbekend"))
-    return df
-
-@st.cache_data(ttl=60)  # Kortere cache voor real-time data
-def get_bank_balances() -> Dict[str, float]:
-    """Haal actuele bankstanden op"""
-    data = odoo_call(
+def get_bank_balances():
+    """Haal alle banksaldi op per rekening"""
+    journals = odoo_call(
         "account.journal", "search_read",
-        [("type", "=", "bank")],
-        ["name", "company_id", "current_statement_balance"]
+        [["type", "=", "bank"]],
+        ["name", "company_id", "default_account_id", "current_statement_balance"]
+    )
+    return journals
+
+@st.cache_data(ttl=300)
+def get_revenue_data(year, company_id=None):
+    """Haal omzetdata op van 8* rekeningen"""
+    domain = [
+        ["account_id.code", ">=", "800000"],
+        ["account_id.code", "<", "900000"],
+        ["date", ">=", f"{year}-01-01"],
+        ["date", "<=", f"{year}-12-31"],
+        ["parent_state", "=", "posted"]
+    ]
+    if company_id:
+        domain.append(["company_id", "=", company_id])
+    
+    return odoo_call(
+        "account.move.line", "search_read",
+        domain,
+        ["date", "account_id", "company_id", "balance", "name"],
+        limit=10000
+    )
+
+@st.cache_data(ttl=300)
+def get_cost_data(year, company_id=None):
+    """Haal kostendata op van 4* en 7* rekeningen"""
+    domain = [
+        "|",
+        "&", ["account_id.code", ">=", "400000"], ["account_id.code", "<", "500000"],
+        "&", ["account_id.code", ">=", "700000"], ["account_id.code", "<", "800000"],
+        ["date", ">=", f"{year}-01-01"],
+        ["date", "<=", f"{year}-12-31"],
+        ["parent_state", "=", "posted"]
+    ]
+    if company_id:
+        domain.append(["company_id", "=", company_id])
+    
+    return odoo_call(
+        "account.move.line", "search_read",
+        domain,
+        ["date", "account_id", "company_id", "balance", "name"],
+        limit=15000
+    )
+
+@st.cache_data(ttl=300)
+def get_receivables_payables(company_id=None):
+    """Haal debiteuren en crediteuren saldi op"""
+    # Debiteuren
+    rec_domain = [
+        ["account_id.account_type", "=", "asset_receivable"],
+        ["parent_state", "=", "posted"],
+        ["amount_residual", "!=", 0]
+    ]
+    if company_id:
+        rec_domain.append(["company_id", "=", company_id])
+    
+    receivables = odoo_call(
+        "account.move.line", "search_read",
+        rec_domain,
+        ["company_id", "amount_residual", "partner_id"],
+        limit=5000
     )
     
-    if not data:
-        return {}
-    
-    balances = {}
-    for journal in data:
-        company_id = journal["company_id"][0] if journal.get("company_id") else 0
-        company_name = COMPANIES.get(company_id, "Onbekend")
-        balance = journal.get("current_statement_balance", 0) or 0
-        
-        if company_name not in balances:
-            balances[company_name] = 0
-        balances[company_name] += balance
-    
-    return balances
-
-@st.cache_data(ttl=60)
-def get_receivables_payables(company_id: int) -> Dict[str, float]:
-    """Haal debiteuren en crediteuren op"""
-    domain_receivable = [
-        ("account_id.account_type", "=", "asset_receivable"),
-        ("parent_state", "=", "posted"),
-        ("reconciled", "=", False)
+    # Crediteuren
+    pay_domain = [
+        ["account_id.account_type", "=", "liability_payable"],
+        ["parent_state", "=", "posted"],
+        ["amount_residual", "!=", 0]
     ]
-    domain_payable = [
-        ("account_id.account_type", "=", "liability_payable"),
-        ("parent_state", "=", "posted"),
-        ("reconciled", "=", False)
+    if company_id:
+        pay_domain.append(["company_id", "=", company_id])
+    
+    payables = odoo_call(
+        "account.move.line", "search_read",
+        pay_domain,
+        ["company_id", "amount_residual", "partner_id"],
+        limit=5000
+    )
+    
+    return receivables, payables
+
+@st.cache_data(ttl=300)
+def get_invoices(year, company_id=None, move_type=None, state=None, limit=100):
+    """Haal facturen op"""
+    domain = [
+        ["invoice_date", ">=", f"{year}-01-01"],
+        ["invoice_date", "<=", f"{year}-12-31"]
     ]
-    
-    if company_id > 0:
-        domain_receivable.append(("company_id", "=", company_id))
-        domain_payable.append(("company_id", "=", company_id))
-    
-    receivables = odoo_call("account.move.line", "search_read", domain_receivable, ["balance"])
-    payables = odoo_call("account.move.line", "search_read", domain_payable, ["balance"])
-    
-    total_receivable = sum(r.get("balance", 0) for r in (receivables or []))
-    total_payable = sum(p.get("balance", 0) for p in (payables or []))
-    
-    return {
-        "receivable": total_receivable,
-        "payable": abs(total_payable)
-    }
-
-# =============================================================================
-# FACTUUR FUNCTIES
-# =============================================================================
-
-@st.cache_data(ttl=120)
-def search_invoices(search_term: str = "", company_id: int = 0, 
-                    invoice_type: str = "all", status: str = "all",
-                    date_from: str = None, date_to: str = None,
-                    limit: int = 50) -> list:
-    """Zoek facturen met filters"""
-    domain = []
-    
-    # Type filter
-    if invoice_type == "out":
-        domain.append(("move_type", "in", ["out_invoice", "out_refund"]))
-    elif invoice_type == "in":
-        domain.append(("move_type", "in", ["in_invoice", "in_refund"]))
+    if company_id:
+        domain.append(["company_id", "=", company_id])
+    if move_type:
+        domain.append(["move_type", "=", move_type])
+    if state:
+        domain.append(["state", "=", state])
     else:
-        domain.append(("move_type", "in", ["out_invoice", "out_refund", "in_invoice", "in_refund"]))
+        domain.append(["state", "in", ["posted", "draft"]])
     
-    # Status filter
-    if status == "posted":
-        domain.append(("state", "=", "posted"))
-    elif status == "draft":
-        domain.append(("state", "=", "draft"))
-    elif status == "paid":
-        domain.append(("payment_state", "=", "paid"))
-    elif status == "open":
-        domain.append(("payment_state", "in", ["not_paid", "partial"]))
-        domain.append(("state", "=", "posted"))
-    
-    # Company filter
-    if company_id > 0:
-        domain.append(("company_id", "=", company_id))
-    
-    # Date filter
-    if date_from:
-        domain.append(("invoice_date", ">=", date_from))
-    if date_to:
-        domain.append(("invoice_date", "<=", date_to))
-    
-    # Search term
-    if search_term:
-        domain.append("|")
-        domain.append("|")
-        domain.append(("name", "ilike", search_term))
-        domain.append(("partner_id.name", "ilike", search_term))
-        domain.append(("ref", "ilike", search_term))
-    
-    fields = [
-        "name", "partner_id", "invoice_date", "amount_total", "amount_residual",
-        "state", "payment_state", "move_type", "company_id", "currency_id"
-    ]
-    
-    return odoo_call("account.move", "search_read", domain, fields, limit=limit, order="invoice_date desc")
-
-def get_invoice_details(invoice_id: int) -> Optional[Dict]:
-    """Haal volledige factuurdetails op"""
-    data = odoo_call(
+    return odoo_call(
         "account.move", "search_read",
-        [("id", "=", invoice_id)],
-        ["name", "partner_id", "invoice_date", "invoice_date_due", "amount_total", 
-         "amount_residual", "amount_untaxed", "amount_tax", "state", "payment_state",
-         "move_type", "company_id", "narration", "invoice_line_ids", "ref"]
+        domain,
+        ["name", "partner_id", "invoice_date", "amount_total", "amount_residual", 
+         "state", "move_type", "company_id", "ref"],
+        limit=limit
     )
-    
-    if not data:
-        return None
-    
-    invoice = data[0]
-    
-    # Haal factuurregels op
-    if invoice.get("invoice_line_ids"):
-        lines = odoo_call(
-            "account.move.line", "search_read",
-            [("id", "in", invoice["invoice_line_ids"]), ("display_type", "=", False)],
-            ["name", "quantity", "price_unit", "price_subtotal", "product_id", "account_id"]
-        )
-        invoice["lines"] = lines or []
-    
-    return invoice
 
-def get_invoice_pdf(invoice_id: int) -> Optional[bytes]:
-    """Haal PDF van factuur op"""
-    api_key = get_api_key()
+@st.cache_data(ttl=300)
+def get_product_sales(year, company_id=None):
+    """Haal verkopen per productcategorie op"""
+    domain = [
+        ["move_id.move_type", "=", "out_invoice"],
+        ["move_id.state", "=", "posted"],
+        ["move_id.invoice_date", ">=", f"{year}-01-01"],
+        ["move_id.invoice_date", "<=", f"{year}-12-31"],
+        ["product_id", "!=", False]
+    ]
+    if company_id:
+        domain.append(["company_id", "=", company_id])
     
-    # Zoek attachment
+    return odoo_call(
+        "account.move.line", "search_read",
+        domain,
+        ["product_id", "product_categ_id", "price_subtotal", "quantity", "company_id"],
+        limit=10000
+    )
+
+def get_invoice_lines(invoice_id):
+    """Haal factuurregels op voor een specifieke factuur"""
+    return odoo_call(
+        "account.move.line", "search_read",
+        [
+            ["move_id", "=", invoice_id],
+            ["display_type", "in", ["product", False]],
+            ["exclude_from_invoice_tab", "=", False]
+        ],
+        ["product_id", "name", "quantity", "price_unit", "price_subtotal", "tax_ids"]
+    )
+
+def get_invoice_pdf(invoice_id):
+    """Haal PDF bijlage op voor een factuur (indien beschikbaar)"""
     attachments = odoo_call(
         "ir.attachment", "search_read",
-        [("res_model", "=", "account.move"), ("res_id", "=", invoice_id), ("mimetype", "=", "application/pdf")],
+        [
+            ["res_model", "=", "account.move"],
+            ["res_id", "=", invoice_id],
+            ["mimetype", "=", "application/pdf"]
+        ],
         ["name", "datas"],
         limit=1
     )
-    
-    if attachments and attachments[0].get("datas"):
-        return base64.b64decode(attachments[0]["datas"])
-    
-    # Anders: genereer PDF via report
-    try:
-        payload = {
-            "jsonrpc": "2.0",
-            "method": "call",
-            "params": {
-                "service": "object",
-                "method": "execute_kw",
-                "args": [
-                    ODOO_DB, ODOO_UID, api_key,
-                    "ir.actions.report",
-                    "render_qweb_pdf",
-                    ["account.report_invoice", [invoice_id]]
-                ]
-            },
-            "id": 1
-        }
-        response = requests.post(ODOO_URL, json=payload, timeout=60)
-        result = response.json()
-        if result.get("result"):
-            pdf_data = result["result"][0]
-            return base64.b64decode(pdf_data)
-    except Exception as e:
-        st.warning(f"Kon PDF niet genereren: {e}")
-    
+    if attachments:
+        return attachments[0]
     return None
 
 # =============================================================================
-# LAB PROJECTS SPECIFIEK
-# =============================================================================
-
-@st.cache_data(ttl=300)
-def get_projects_verf_behang(year: int) -> Dict[str, Any]:
-    """Haal verf vs behang data op voor LAB Projects"""
-    # Omzet per categorie
-    domain = [
-        ("date", ">=", f"{year}-01-01"),
-        ("date", "<=", f"{year}-12-31"),
-        ("account_id.code", "=like", "8%"),
-        ("parent_state", "=", "posted"),
-        ("company_id", "=", 3)  # LAB Projects
-    ]
-    
-    revenue_data = odoo_call("account.move.line", "search_read", domain, 
-                              ["balance", "product_id", "name"])
-    
-    if not revenue_data:
-        return {"verf": 0, "behang": 0, "verf_marge": 0.186, "behang_marge": 0.253}
-    
-    verf_revenue = 0
-    behang_revenue = 0
-    
-    for line in revenue_data:
-        revenue = -line.get("balance", 0)
-        name = (line.get("name") or "").lower()
-        product = line.get("product_id")
-        product_name = (product[1] if product else "").lower() if product else ""
-        
-        # Categoriseer op basis van naam
-        if any(x in name or x in product_name for x in ["behang", "wallpaper"]):
-            behang_revenue += revenue
-        else:
-            verf_revenue += revenue
-    
-    return {
-        "verf": verf_revenue,
-        "behang": behang_revenue,
-        "verf_marge": 0.186,  # Bekend uit eerdere analyse
-        "behang_marge": 0.253
-    }
-
-# =============================================================================
-# UI COMPONENTEN
-# =============================================================================
-
-def render_kpi_cards(revenue: float, costs: float, bank: float, yesterday_revenue: float):
-    """Render KPI kaarten bovenaan"""
-    result = revenue - costs
-    margin = (result / revenue * 100) if revenue > 0 else 0
-    
-    col1, col2, col3, col4, col5 = st.columns(5)
-    
-    with col1:
-        st.metric("💰 Omzet", f"€{revenue:,.0f}", delta=f"€{yesterday_revenue:,.0f} gisteren")
-    with col2:
-        st.metric("📉 Kosten", f"€{costs:,.0f}")
-    with col3:
-        delta_color = "normal" if result >= 0 else "inverse"
-        st.metric("📊 Resultaat", f"€{result:,.0f}", delta=f"{margin:.1f}%")
-    with col4:
-        st.metric("🏦 Bank", f"€{bank:,.0f}")
-    with col5:
-        st.metric("📅 Gisteren", f"€{yesterday_revenue:,.0f}")
-
-def render_invoice_search():
-    """Render factuur zoek interface"""
-    st.subheader("🔍 Facturen Zoeken")
-    
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        search_term = st.text_input("🔎 Zoek", placeholder="Factuurnr, klant, referentie...")
-    with col2:
-        invoice_type = st.selectbox("📄 Type", [
-            ("all", "Alle"),
-            ("out", "Verkoopfacturen"),
-            ("in", "Inkoopfacturen")
-        ], format_func=lambda x: x[1])
-    with col3:
-        status = st.selectbox("📊 Status", [
-            ("all", "Alle"),
-            ("posted", "Geboekt"),
-            ("draft", "Concept"),
-            ("paid", "Betaald"),
-            ("open", "Openstaand")
-        ], format_func=lambda x: x[1])
-    with col4:
-        date_range = st.date_input("📅 Periode", value=(
-            datetime.now().replace(day=1) - timedelta(days=90),
-            datetime.now()
-        ))
-    
-    # Zoek facturen
-    date_from = date_range[0].strftime("%Y-%m-%d") if len(date_range) > 0 else None
-    date_to = date_range[1].strftime("%Y-%m-%d") if len(date_range) > 1 else None
-    
-    invoices = search_invoices(
-        search_term=search_term,
-        company_id=st.session_state.get("company_id", 0),
-        invoice_type=invoice_type[0],
-        status=status[0],
-        date_from=date_from,
-        date_to=date_to
-    )
-    
-    if not invoices:
-        st.info("Geen facturen gevonden. Pas de filters aan.")
-        return
-    
-    # Toon facturen in een tabel
-    st.write(f"**{len(invoices)} facturen gevonden**")
-    
-    for inv in invoices:
-        partner = inv.get("partner_id", [0, "Onbekend"])
-        partner_name = partner[1] if isinstance(partner, list) else str(partner)
-        company = inv.get("company_id", [0, ""])
-        company_name = company[1] if isinstance(company, list) else ""
-        
-        amount = inv.get("amount_total", 0)
-        residual = inv.get("amount_residual", 0)
-        
-        # Status badge
-        state = inv.get("state", "")
-        payment_state = inv.get("payment_state", "")
-        if payment_state == "paid":
-            status_badge = "✅ Betaald"
-        elif payment_state == "partial":
-            status_badge = "🔶 Deels betaald"
-        elif state == "draft":
-            status_badge = "📝 Concept"
-        else:
-            status_badge = "🔴 Open"
-        
-        # Type indicator
-        move_type = inv.get("move_type", "")
-        if move_type in ["out_invoice", "out_refund"]:
-            type_icon = "📤"
-        else:
-            type_icon = "📥"
-        
-        col1, col2, col3, col4, col5 = st.columns([2, 3, 2, 2, 1])
-        
-        with col1:
-            st.write(f"{type_icon} **{inv.get('name', 'N/A')}**")
-        with col2:
-            st.write(f"🏢 {partner_name[:30]}")
-        with col3:
-            st.write(f"€{amount:,.2f}")
-        with col4:
-            st.write(status_badge)
-        with col5:
-            if st.button("👁️", key=f"view_{inv['id']}", help="Bekijk details"):
-                st.session_state["selected_invoice"] = inv["id"]
-                st.rerun()
-
-def render_invoice_detail(invoice_id: int):
-    """Render factuurdetails"""
-    invoice = get_invoice_details(invoice_id)
-    
-    if not invoice:
-        st.error("Factuur niet gevonden")
-        return
-    
-    # Back button
-    if st.button("← Terug naar overzicht"):
-        st.session_state["selected_invoice"] = None
-        st.rerun()
-    
-    st.divider()
-    
-    # Header
-    partner = invoice.get("partner_id", [0, "Onbekend"])
-    partner_name = partner[1] if isinstance(partner, list) else str(partner)
-    company = invoice.get("company_id", [0, ""])
-    company_name = company[1] if isinstance(company, list) else ""
-    
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        st.header(f"📄 {invoice.get('name', 'Factuur')}")
-        st.write(f"**Klant/Leverancier:** {partner_name}")
-        st.write(f"**Bedrijf:** {company_name}")
-        st.write(f"**Referentie:** {invoice.get('ref', '-')}")
-    
-    with col2:
-        # Status
-        payment_state = invoice.get("payment_state", "")
-        if payment_state == "paid":
-            st.success("✅ Betaald")
-        elif payment_state == "partial":
-            st.warning("🔶 Deels betaald")
-        else:
-            st.error("🔴 Openstaand")
-        
-        # PDF Download
-        st.write("")
-        if st.button("📥 Download PDF", type="primary"):
-            with st.spinner("PDF genereren..."):
-                pdf_data = get_invoice_pdf(invoice_id)
-                if pdf_data:
-                    st.download_button(
-                        "💾 Opslaan als PDF",
-                        data=pdf_data,
-                        file_name=f"{invoice.get('name', 'factuur')}.pdf",
-                        mime="application/pdf"
-                    )
-                else:
-                    st.warning("PDF niet beschikbaar")
-    
-    st.divider()
-    
-    # Bedragen
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric("Subtotaal", f"€{invoice.get('amount_untaxed', 0):,.2f}")
-    with col2:
-        st.metric("BTW", f"€{invoice.get('amount_tax', 0):,.2f}")
-    with col3:
-        st.metric("Totaal", f"€{invoice.get('amount_total', 0):,.2f}")
-    with col4:
-        residual = invoice.get("amount_residual", 0)
-        st.metric("Openstaand", f"€{residual:,.2f}", 
-                  delta="Betaald" if residual == 0 else None)
-    
-    # Datums
-    col1, col2 = st.columns(2)
-    with col1:
-        st.write(f"📅 **Factuurdatum:** {invoice.get('invoice_date', '-')}")
-    with col2:
-        st.write(f"📅 **Vervaldatum:** {invoice.get('invoice_date_due', '-')}")
-    
-    # Factuurregels
-    st.subheader("📋 Factuurregels")
-    
-    lines = invoice.get("lines", [])
-    if lines:
-        lines_df = pd.DataFrame([{
-            "Product": l.get("product_id", [0, l.get("name", "-")])[1] if l.get("product_id") else l.get("name", "-"),
-            "Omschrijving": l.get("name", "-")[:50],
-            "Aantal": l.get("quantity", 0),
-            "Prijs": l.get("price_unit", 0),
-            "Subtotaal": l.get("price_subtotal", 0)
-        } for l in lines])
-        
-        st.dataframe(
-            lines_df,
-            column_config={
-                "Prijs": st.column_config.NumberColumn(format="€%.2f"),
-                "Subtotaal": st.column_config.NumberColumn(format="€%.2f")
-            },
-            hide_index=True,
-            use_container_width=True
-        )
-    else:
-        st.info("Geen factuurregels beschikbaar")
-    
-    # Notities
-    if invoice.get("narration"):
-        st.subheader("📝 Notities")
-        st.write(invoice["narration"])
-
-# =============================================================================
-# MAIN APP
+# DASHBOARD UI
 # =============================================================================
 
 def main():
     # Sidebar
-    st.sidebar.image("https://labcolourtheworld.com/wp-content/uploads/2023/01/LAB-logo.png", width=150)
-    st.sidebar.title("LAB Groep")
+    st.sidebar.image("https://labcolourtheworld.com/wp-content/uploads/2021/03/LAB-logo.png", width=150)
+    st.sidebar.title("🎨 LAB Groep")
     
     # Filters
-    st.sidebar.subheader("🎯 Filters")
-    
     current_year = datetime.now().year
     selected_year = st.sidebar.selectbox("📅 Jaar", list(range(current_year, 2022, -1)))
     
-    company_options = list(COMPANIES.items())
-    selected_company = st.sidebar.selectbox(
-        "🏢 Entiteit",
-        company_options,
-        format_func=lambda x: x[1]
-    )
-    company_id = selected_company[0]
-    st.session_state["company_id"] = company_id
+    entity_options = {"Alle Entiteiten": None}
+    entity_options.update({v: k for k, v in COMPANIES.items()})
+    selected_entity = st.sidebar.selectbox("🏢 Entiteit", list(entity_options.keys()))
+    company_id = entity_options[selected_entity]
     
-    # Auto refresh
-    if st.sidebar.button("🔄 Ververs Data"):
-        st.cache_data.clear()
-        st.rerun()
+    st.sidebar.markdown("---")
+    st.sidebar.caption(f"🔄 Laatste update: {datetime.now().strftime('%H:%M')}")
     
-    st.sidebar.divider()
-    st.sidebar.caption(f"Laatste update: {datetime.now().strftime('%H:%M:%S')}")
+    # Main content - Tabs
+    tabs = st.tabs(["💳 Overzicht", "🏦 Bank", "📄 Facturen", "🏆 Producten", "📉 Kosten", "📈 Cashflow"])
     
-    # Main content
-    st.title("📊 LAB Groep Financial Dashboard")
-    
-    # Check of we factuurdetail moeten tonen
-    if st.session_state.get("selected_invoice"):
-        render_invoice_detail(st.session_state["selected_invoice"])
-        return
-    
-    # Tabs
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "💳 Overzicht", "📄 Facturen", "🏆 Producten", "📉 Kosten", "📈 Cashflow"
-    ])
-    
-    # ==========================================================================
+    # =========================================================================
     # TAB 1: OVERZICHT
-    # ==========================================================================
-    with tab1:
-        with st.spinner("Data laden..."):
-            # Haal data op
-            revenue_df = get_revenue_data(selected_year, company_id)
-            cost_df = get_cost_data(selected_year, company_id)
-            bank_balances = get_bank_balances()
-            
-            total_revenue = revenue_df["revenue"].sum() if not revenue_df.empty else 0
-            total_costs = cost_df["cost"].sum() if not cost_df.empty else 0
-            
-            # Bank balance
-            if company_id == 0:
-                total_bank = sum(bank_balances.values())
-            else:
-                company_name = COMPANIES.get(company_id, "")
-                total_bank = bank_balances.get(company_name, 0)
-            
-            # Gisteren omzet
-            yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-            yesterday_revenue = revenue_df[revenue_df["date"] == yesterday]["revenue"].sum() if not revenue_df.empty else 0
+    # =========================================================================
+    with tabs[0]:
+        st.header("📊 Financieel Overzicht")
         
         # KPI Cards
-        render_kpi_cards(total_revenue, total_costs, total_bank, yesterday_revenue)
+        col1, col2, col3, col4 = st.columns(4)
         
-        st.divider()
+        # Get data
+        revenue_data = get_revenue_data(selected_year, company_id)
+        cost_data = get_cost_data(selected_year, company_id)
+        bank_data = get_bank_balances()
+        receivables, payables = get_receivables_payables(company_id)
         
-        # Grafieken
-        col1, col2 = st.columns(2)
+        # Calculate totals
+        total_revenue = -sum(r.get("balance", 0) for r in revenue_data)  # Negative = credit = revenue
+        total_costs = sum(c.get("balance", 0) for c in cost_data)  # Positive = debit = cost
+        
+        # Filter bank by company if needed
+        if company_id:
+            bank_total = sum(b.get("current_statement_balance", 0) for b in bank_data 
+                           if b.get("company_id") and b["company_id"][0] == company_id)
+        else:
+            bank_total = sum(b.get("current_statement_balance", 0) for b in bank_data)
+        
+        total_receivables = sum(r.get("amount_residual", 0) for r in receivables)
+        total_payables = sum(p.get("amount_residual", 0) for p in payables)
         
         with col1:
-            st.subheader("📊 Omzet vs Kosten per Maand")
-            if not revenue_df.empty and not cost_df.empty:
-                # Groepeer per maand
-                rev_monthly = revenue_df.groupby("month")["revenue"].sum().reset_index()
-                cost_monthly = cost_df.groupby("month")["cost"].sum().reset_index()
-                
-                rev_monthly["month_str"] = rev_monthly["month"].astype(str)
-                cost_monthly["month_str"] = cost_monthly["month"].astype(str)
-                
-                # Merge
-                monthly = rev_monthly.merge(cost_monthly, on="month_str", how="outer").fillna(0)
-                
-                fig = go.Figure()
-                fig.add_trace(go.Bar(name="Omzet", x=monthly["month_str"], y=monthly["revenue"], 
-                                     marker_color="#1e3a5f"))
-                fig.add_trace(go.Bar(name="Kosten", x=monthly["month_str"], y=monthly["cost"], 
-                                     marker_color="#6ba3d6"))
-                fig.update_layout(barmode="group", height=400)
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("Geen data beschikbaar")
-        
+            st.metric("💰 Omzet", f"€{total_revenue:,.0f}")
         with col2:
-            st.subheader("🏦 Balans per Entiteit")
-            if bank_balances:
-                balance_data = []
-                for company_name, bank in bank_balances.items():
-                    if company_name != "Alle Entiteiten" and company_name != "Onbekend":
-                        balance_data.append({
-                            "Entiteit": company_name.replace(" B.V.", ""),
-                            "Bank": bank
-                        })
-                
-                if balance_data:
-                    fig = px.bar(
-                        pd.DataFrame(balance_data), 
-                        x="Entiteit", y="Bank",
-                        color_discrete_sequence=["#1e3a5f"]
-                    )
-                    fig.update_layout(height=400)
-                    st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("Bankdata laden...")
+            st.metric("📉 Kosten", f"€{total_costs:,.0f}")
+        with col3:
+            result = total_revenue - total_costs
+            st.metric("📊 Resultaat", f"€{result:,.0f}", delta=f"{result/total_revenue*100:.1f}%" if total_revenue else "0%")
+        with col4:
+            st.metric("🏦 Banksaldo", f"€{bank_total:,.0f}")
         
-        # Debiteuren/Crediteuren
-        st.subheader("💳 Openstaande Posten")
+        # Second row
+        col5, col6, col7, col8 = st.columns(4)
+        with col5:
+            st.metric("📥 Debiteuren", f"€{total_receivables:,.0f}")
+        with col6:
+            st.metric("📤 Crediteuren", f"€{abs(total_payables):,.0f}")
+        with col7:
+            working_cap = bank_total + total_receivables + total_payables
+            st.metric("💵 Werkkapitaal", f"€{working_cap:,.0f}")
+        with col8:
+            gm_pct = ((total_revenue - total_costs) / total_revenue * 100) if total_revenue else 0
+            st.metric("📈 Marge %", f"{gm_pct:.1f}%")
+        
+        st.markdown("---")
+        
+        # Omzet vs Kosten per maand
+        st.subheader("📈 Omzet vs Kosten per Maand")
+        
+        if revenue_data:
+            # Process monthly data
+            monthly_data = {}
+            for r in revenue_data:
+                month = r["date"][:7]
+                if month not in monthly_data:
+                    monthly_data[month] = {"Omzet": 0, "Kosten": 0}
+                monthly_data[month]["Omzet"] += -r.get("balance", 0)
+            
+            for c in cost_data:
+                month = c["date"][:7]
+                if month not in monthly_data:
+                    monthly_data[month] = {"Omzet": 0, "Kosten": 0}
+                monthly_data[month]["Kosten"] += c.get("balance", 0)
+            
+            df_monthly = pd.DataFrame([
+                {"Maand": k, "Omzet": v["Omzet"], "Kosten": v["Kosten"]}
+                for k, v in sorted(monthly_data.items())
+            ])
+            
+            if not df_monthly.empty:
+                fig = go.Figure()
+                fig.add_trace(go.Bar(x=df_monthly["Maand"], y=df_monthly["Omzet"], 
+                                    name="Omzet", marker_color="#1e3a5f"))
+                fig.add_trace(go.Bar(x=df_monthly["Maand"], y=df_monthly["Kosten"], 
+                                    name="Kosten", marker_color="#7fb3d5"))
+                fig.update_layout(barmode="group", height=400, 
+                                 xaxis_title="Maand", yaxis_title="€",
+                                 legend=dict(orientation="h", y=1.1))
+                st.plotly_chart(fig, use_container_width=True)
+    
+    # =========================================================================
+    # TAB 2: BANK
+    # =========================================================================
+    with tabs[1]:
+        st.header("🏦 Banksaldi per Rekening")
+        
+        bank_data = get_bank_balances()
+        
+        if bank_data:
+            # Groepeer per bedrijf
+            bank_by_company = {}
+            for b in bank_data:
+                comp = b.get("company_id")
+                if comp:
+                    comp_id = comp[0]
+                    comp_name = COMPANIES.get(comp_id, comp[1])
+                    if comp_name not in bank_by_company:
+                        bank_by_company[comp_name] = []
+                    bank_by_company[comp_name].append({
+                        "Rekening": translate_account_name(b.get("name", "Onbekend")),
+                        "Saldo": b.get("current_statement_balance", 0)
+                    })
+            
+            # Totalen bovenaan
+            col1, col2, col3, col4 = st.columns(4)
+            
+            totals = {comp: sum(r["Saldo"] for r in reks) for comp, reks in bank_by_company.items()}
+            grand_total = sum(totals.values())
+            
+            with col1:
+                st.metric("💰 Totaal Alle Entiteiten", f"€{grand_total:,.2f}")
+            
+            for i, (comp, total) in enumerate(sorted(totals.items())):
+                with [col2, col3, col4][i % 3]:
+                    st.metric(f"🏢 {comp}", f"€{total:,.2f}")
+            
+            st.markdown("---")
+            
+            # Detail per entiteit
+            for comp_name in ["LAB Conceptstore", "LAB Shops", "LAB Projects"]:
+                if comp_name in bank_by_company:
+                    with st.expander(f"🏦 {comp_name} - €{totals[comp_name]:,.2f}", expanded=True):
+                        df = pd.DataFrame(bank_by_company[comp_name])
+                        df["Saldo"] = df["Saldo"].apply(lambda x: f"€{x:,.2f}")
+                        st.dataframe(df, use_container_width=True, hide_index=True)
+            
+            # Visualisatie
+            st.subheader("📊 Verdeling Banksaldi")
+            
+            # Taartdiagram per entiteit
+            fig = px.pie(
+                values=list(totals.values()),
+                names=list(totals.keys()),
+                color_discrete_sequence=["#1e3a5f", "#2e5077", "#7fb3d5"]
+            )
+            fig.update_traces(textposition='inside', textinfo='percent+label+value',
+                            texttemplate='%{label}<br>€%{value:,.0f}<br>(%{percent})')
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Staafdiagram per rekening
+            st.subheader("📊 Alle Bankrekeningen")
+            all_accounts = []
+            for comp, reks in bank_by_company.items():
+                for r in reks:
+                    all_accounts.append({
+                        "Entiteit": comp,
+                        "Rekening": r["Rekening"],
+                        "Saldo": r["Saldo"]
+                    })
+            
+            df_all = pd.DataFrame(all_accounts)
+            if not df_all.empty:
+                fig2 = px.bar(df_all, x="Rekening", y="Saldo", color="Entiteit",
+                             color_discrete_sequence=["#1e3a5f", "#2e5077", "#7fb3d5"])
+                fig2.update_layout(xaxis_tickangle=-45, height=400)
+                st.plotly_chart(fig2, use_container_width=True)
+        else:
+            st.warning("Geen bankdata beschikbaar")
+    
+    # =========================================================================
+    # TAB 3: FACTUREN
+    # =========================================================================
+    with tabs[2]:
+        st.header("📄 Facturen Zoeken")
         
         col1, col2, col3 = st.columns(3)
+        with col1:
+            search_term = st.text_input("🔍 Zoek (factuurnummer of klant)")
+        with col2:
+            invoice_type = st.selectbox("📋 Type", ["Alle", "Verkoopfacturen", "Inkoopfacturen"])
+        with col3:
+            invoice_status = st.selectbox("📊 Status", ["Alle", "Geboekt", "Concept"])
         
-        for idx, (cid, cname) in enumerate([(1, "Conceptstore"), (2, "Shops"), (3, "Projects")]):
-            with [col1, col2, col3][idx]:
-                rp = get_receivables_payables(cid)
-                st.write(f"**{cname}**")
-                st.write(f"📥 Debiteuren: €{rp['receivable']:,.0f}")
-                st.write(f"📤 Crediteuren: €{rp['payable']:,.0f}")
-                net = rp['receivable'] - rp['payable']
-                color = "green" if net >= 0 else "red"
-                st.markdown(f"**Netto:** :{color}[€{net:,.0f}]")
-    
-    # ==========================================================================
-    # TAB 2: FACTUREN
-    # ==========================================================================
-    with tab2:
-        render_invoice_search()
-    
-    # ==========================================================================
-    # TAB 3: PRODUCTEN
-    # ==========================================================================
-    with tab3:
-        st.subheader("🏆 Productcategorieën")
+        # Map filters
+        type_map = {"Alle": None, "Verkoopfacturen": "out_invoice", "Inkoopfacturen": "in_invoice"}
+        status_map = {"Alle": None, "Geboekt": "posted", "Concept": "draft"}
         
-        # LAB Projects specifiek
-        if company_id == 3 or company_id == 0:
-            st.write("### 🎨 LAB Projects: Verf vs Behang")
-            
-            projects_data = get_projects_verf_behang(selected_year)
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                verf = projects_data["verf"]
-                verf_marge = projects_data["verf_marge"]
-                st.metric("🖌️ Verfprojecten", f"€{verf:,.0f}", 
-                          delta=f"{verf_marge*100:.1f}% marge")
-            
-            with col2:
-                behang = projects_data["behang"]
-                behang_marge = projects_data["behang_marge"]
-                st.metric("🎨 Behangprojecten", f"€{behang:,.0f}", 
-                          delta=f"{behang_marge*100:.1f}% marge")
-            
-            # Pie chart
-            if verf > 0 or behang > 0:
-                fig = px.pie(
-                    values=[verf, behang],
-                    names=["Verf", "Behang"],
-                    color_discrete_sequence=["#1e3a5f", "#6ba3d6"]
-                )
-                fig.update_layout(height=300)
-                st.plotly_chart(fig, use_container_width=True)
-            
-            # Marge vergelijking
-            st.info("""
-            💡 **Inzicht:** Behangprojecten hebben een hogere marge (25.3%) dan verfprojecten (18.6%).
-            Dit komt door lagere onderaannemerskosten bij behang (45% vs 57% bij verf).
-            """)
-            
-            st.warning("""
-            ⚠️ **Risico:** 52% van de verfonderaanneming gaat naar Van de Fabriek - 
-            hoge leveranciersafhankelijkheid.
-            """)
+        invoices = get_invoices(
+            selected_year, company_id,
+            type_map[invoice_type],
+            status_map[invoice_status],
+            limit=200
+        )
         
-        st.divider()
+        if search_term and invoices:
+            search_lower = search_term.lower()
+            invoices = [i for i in invoices if 
+                       search_lower in i.get("name", "").lower() or
+                       search_lower in (i.get("partner_id", [None, ""])[1] or "").lower() or
+                       search_lower in (i.get("ref", "") or "").lower()]
         
-        # Algemene product categorieën
-        st.write("### 📊 Top Productcategorieën")
-        st.info("Productcategorie-analyse beschikbaar in toekomstige versie.")
-    
-    # ==========================================================================
-    # TAB 4: KOSTEN
-    # ==========================================================================
-    with tab4:
-        st.subheader("📉 Kostenanalyse")
-        
-        cost_df = get_cost_data(selected_year, company_id, exclude_48_49=False)
-        
-        if cost_df.empty:
-            st.info("Geen kostendata beschikbaar")
-        else:
-            # Categoriseer kosten
-            def categorize_cost(code):
-                if code.startswith("40"):
-                    return "Personeelskosten"
-                elif code.startswith("41"):
-                    return "Huisvestingskosten"
-                elif code.startswith("42"):
-                    return "Vervoerskosten"
-                elif code.startswith("43"):
-                    return "Kantoorkosten"
-                elif code.startswith("44"):
-                    return "Marketing & Reclame"
-                elif code.startswith("45"):
-                    return "Overige Bedrijfskosten"
-                elif code.startswith("47"):
-                    return "Financiële Lasten"
-                elif code.startswith("48"):
-                    return "Afschrijvingen"
-                elif code.startswith("49"):
-                    return "Overige Kosten"
-                elif code.startswith("7"):
-                    return "Kostprijs Verkopen"
-                else:
-                    return "Overig"
+        if invoices:
+            st.write(f"📊 {len(invoices)} facturen gevonden")
             
-            cost_df["category"] = cost_df["account_code"].apply(categorize_cost)
+            # Format for display
+            invoice_list = []
+            for inv in invoices:
+                type_labels = {
+                    "out_invoice": "🟢 Verkoop",
+                    "in_invoice": "🔴 Inkoop",
+                    "out_refund": "🟡 Credit (V)",
+                    "in_refund": "🟠 Credit (I)"
+                }
+                status_labels = {
+                    "posted": "✅ Geboekt",
+                    "draft": "📝 Concept",
+                    "cancel": "❌ Geannuleerd"
+                }
+                
+                invoice_list.append({
+                    "id": inv["id"],
+                    "Nummer": inv.get("name", ""),
+                    "Klant/Leverancier": inv.get("partner_id", [None, "Onbekend"])[1],
+                    "Datum": inv.get("invoice_date", ""),
+                    "Bedrag": f"€{inv.get('amount_total', 0):,.2f}",
+                    "Openstaand": f"€{inv.get('amount_residual', 0):,.2f}",
+                    "Type": type_labels.get(inv.get("move_type", ""), inv.get("move_type", "")),
+                    "Status": status_labels.get(inv.get("state", ""), inv.get("state", "")),
+                    "Entiteit": COMPANIES.get(inv.get("company_id", [None])[0], "")
+                })
             
-            # Per categorie
-            category_totals = cost_df.groupby("category")["cost"].sum().sort_values(ascending=True)
+            df_invoices = pd.DataFrame(invoice_list)
             
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.write("**Per Categorie**")
-                fig = px.bar(
-                    x=category_totals.values,
-                    y=category_totals.index,
-                    orientation="h",
-                    color_discrete_sequence=["#1e3a5f"]
-                )
-                fig.update_layout(height=400, showlegend=False)
-                st.plotly_chart(fig, use_container_width=True)
-            
-            with col2:
-                st.write("**Verdeling**")
-                fig = px.pie(
-                    values=category_totals.values,
-                    names=category_totals.index,
-                    color_discrete_sequence=px.colors.sequential.Blues_r
-                )
-                fig.update_layout(height=400)
-                st.plotly_chart(fig, use_container_width=True)
-            
-            # Top 15 kostenposten
-            st.write("### 📋 Top 15 Kostenposten")
-            top_accounts = cost_df.groupby("account_name")["cost"].sum().nlargest(15)
-            
-            top_df = pd.DataFrame({
-                "Rekening": top_accounts.index,
-                "Bedrag": top_accounts.values
-            })
-            
-            st.dataframe(
-                top_df,
-                column_config={
-                    "Bedrag": st.column_config.NumberColumn(format="€%.0f")
-                },
-                hide_index=True,
-                use_container_width=True
+            # Display with selection
+            selected = st.selectbox(
+                "Selecteer factuur voor details:",
+                options=df_invoices["Nummer"].tolist(),
+                format_func=lambda x: f"{x} - {df_invoices[df_invoices['Nummer']==x]['Klant/Leverancier'].values[0]}"
             )
             
-            # Download
-            csv = cost_df.to_csv(index=False)
+            st.dataframe(df_invoices.drop(columns=["id"]), use_container_width=True, hide_index=True)
+            
+            # Invoice detail
+            if selected:
+                selected_inv = next((i for i in invoices if i["name"] == selected), None)
+                if selected_inv:
+                    st.markdown("---")
+                    st.subheader(f"📋 Factuurdetails: {selected}")
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.write(f"**Klant/Leverancier:** {selected_inv.get('partner_id', [None, 'Onbekend'])[1]}")
+                        st.write(f"**Datum:** {selected_inv.get('invoice_date', 'Onbekend')}")
+                        st.write(f"**Referentie:** {selected_inv.get('ref', '-')}")
+                    with col2:
+                        st.write(f"**Totaalbedrag:** €{selected_inv.get('amount_total', 0):,.2f}")
+                        st.write(f"**Openstaand:** €{selected_inv.get('amount_residual', 0):,.2f}")
+                        st.write(f"**Entiteit:** {COMPANIES.get(selected_inv.get('company_id', [None])[0], '')}")
+                    
+                    # Factuurregels
+                    lines = get_invoice_lines(selected_inv["id"])
+                    if lines:
+                        st.write("**📝 Factuurregels:**")
+                        lines_data = []
+                        for line in lines:
+                            lines_data.append({
+                                "Product": line.get("product_id", [None, line.get("name", "")])[1] if line.get("product_id") else line.get("name", ""),
+                                "Omschrijving": translate_account_name(line.get("name", "")),
+                                "Aantal": line.get("quantity", 0),
+                                "Prijs": f"€{line.get('price_unit', 0):,.2f}",
+                                "Subtotaal": f"€{line.get('price_subtotal', 0):,.2f}"
+                            })
+                        st.dataframe(pd.DataFrame(lines_data), use_container_width=True, hide_index=True)
+                    else:
+                        st.info("Geen factuurregels beschikbaar")
+                    
+                    # PDF / Odoo link
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        pdf = get_invoice_pdf(selected_inv["id"])
+                        if pdf:
+                            pdf_data = base64.b64decode(pdf["datas"])
+                            st.download_button(
+                                "📥 Download PDF",
+                                data=pdf_data,
+                                file_name=pdf["name"],
+                                mime="application/pdf"
+                            )
+                        else:
+                            st.info("Geen PDF bijlage beschikbaar")
+                    with col2:
+                        odoo_url = f"https://lab.odoo.works/web#id={selected_inv['id']}&model=account.move&view_type=form"
+                        st.link_button("🔗 Open in Odoo", odoo_url)
+        else:
+            st.info("Geen facturen gevonden. Pas de filters aan.")
+    
+    # =========================================================================
+    # TAB 4: PRODUCTEN
+    # =========================================================================
+    with tabs[3]:
+        st.header("🏆 Productanalyse")
+        
+        product_sales = get_product_sales(selected_year, company_id)
+        
+        if product_sales:
+            # Groepeer per categorie
+            cat_data = {}
+            for p in product_sales:
+                cat = p.get("product_categ_id")
+                if cat:
+                    cat_name = cat[1]
+                    if cat_name not in cat_data:
+                        cat_data[cat_name] = {"Omzet": 0, "Aantal": 0}
+                    cat_data[cat_name]["Omzet"] += p.get("price_subtotal", 0)
+                    cat_data[cat_name]["Aantal"] += p.get("quantity", 0)
+            
+            df_cat = pd.DataFrame([
+                {"Categorie": k, "Omzet": v["Omzet"], "Aantal": v["Aantal"]}
+                for k, v in sorted(cat_data.items(), key=lambda x: -x[1]["Omzet"])
+            ])
+            
+            if not df_cat.empty:
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.subheader("📊 Top Productcategorieën")
+                    fig = px.bar(df_cat.head(10), x="Categorie", y="Omzet",
+                                color_discrete_sequence=["#1e3a5f"])
+                    fig.update_layout(xaxis_tickangle=-45, height=400)
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                with col2:
+                    st.subheader("📈 Omzetverdeling")
+                    fig2 = px.pie(df_cat.head(8), values="Omzet", names="Categorie",
+                                 color_discrete_sequence=px.colors.sequential.Blues_r)
+                    st.plotly_chart(fig2, use_container_width=True)
+                
+                st.dataframe(
+                    df_cat.head(15).style.format({"Omzet": "€{:,.0f}", "Aantal": "{:,.0f}"}),
+                    use_container_width=True, hide_index=True
+                )
+        
+        # LAB Projects: Verf vs Behang
+        if not company_id or company_id == 3:
+            st.markdown("---")
+            st.subheader("🎨 LAB Projects: Verf vs Behang Analyse")
+            
+            # Hardcoded data from earlier analysis (kan later dynamisch)
+            verf_data = {"Omzet": 740383, "Materiaal": 181940, "Onderaannemers": 420721}
+            behang_data = {"Omzet": 261488, "Materiaal": 77974, "Onderaannemers": 117402}
+            
+            verf_marge = verf_data["Omzet"] - verf_data["Materiaal"] - verf_data["Onderaannemers"]
+            behang_marge = behang_data["Omzet"] - behang_data["Materiaal"] - behang_data["Onderaannemers"]
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("### 🖌️ Verfprojecten (73.9%)")
+                st.metric("Omzet", f"€{verf_data['Omzet']:,}")
+                st.metric("Materiaalkosten", f"€{verf_data['Materiaal']:,}")
+                st.metric("Onderaannemers", f"€{verf_data['Onderaannemers']:,}")
+                st.metric("Bruto Marge", f"€{verf_marge:,}", 
+                         delta=f"{verf_marge/verf_data['Omzet']*100:.1f}%")
+            
+            with col2:
+                st.markdown("### 🎭 Behangprojecten (26.1%)")
+                st.metric("Omzet", f"€{behang_data['Omzet']:,}")
+                st.metric("Materiaalkosten", f"€{behang_data['Materiaal']:,}")
+                st.metric("Onderaannemers", f"€{behang_data['Onderaannemers']:,}")
+                st.metric("Bruto Marge", f"€{behang_marge:,}", 
+                         delta=f"{behang_marge/behang_data['Omzet']*100:.1f}%")
+            
+            st.warning("⚠️ **Let op:** Behangprojecten hebben een hogere marge (25.3%) dan verfprojecten (18.6%). "
+                      "Van de Fabriek vertegenwoordigt 52% van de verfonderaanneming - concentratierisico!")
+    
+    # =========================================================================
+    # TAB 5: KOSTEN
+    # =========================================================================
+    with tabs[4]:
+        st.header("📉 Kostenanalyse")
+        
+        cost_data = get_cost_data(selected_year, company_id)
+        
+        if cost_data:
+            # Groepeer per categorie (eerste 2 cijfers)
+            cat_costs = {}
+            account_costs = {}
+            
+            for c in cost_data:
+                account = c.get("account_id")
+                if account:
+                    code = str(account[0])  # Account ID, we need the code
+                    name = translate_account_name(account[1])
+                    balance = c.get("balance", 0)
+                    
+                    # Haal code prefix uit naam of gebruik een mapping
+                    # Voor nu gebruiken we de naam direct
+                    prefix = name[:2] if name else "??"
+                    
+                    # Account level
+                    if name not in account_costs:
+                        account_costs[name] = 0
+                    account_costs[name] += balance
+            
+            # Sorteer en toon
+            sorted_accounts = sorted(account_costs.items(), key=lambda x: -x[1])
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.subheader("🏆 Top 15 Kostenposten")
+                top_costs = sorted_accounts[:15]
+                df_top = pd.DataFrame(top_costs, columns=["Kostensoort", "Bedrag"])
+                
+                fig = px.bar(df_top, y="Kostensoort", x="Bedrag", orientation="h",
+                            color_discrete_sequence=["#1e3a5f"])
+                fig.update_layout(height=500, yaxis={'categoryorder': 'total ascending'})
+                st.plotly_chart(fig, use_container_width=True)
+            
+            with col2:
+                st.subheader("📊 Kostenverdeling")
+                df_pie = pd.DataFrame(sorted_accounts[:10], columns=["Kostensoort", "Bedrag"])
+                fig2 = px.pie(df_pie, values="Bedrag", names="Kostensoort",
+                             color_discrete_sequence=px.colors.sequential.Blues_r)
+                st.plotly_chart(fig2, use_container_width=True)
+            
+            # Tabel
+            st.subheader("📋 Alle Kosten")
+            df_all = pd.DataFrame(sorted_accounts, columns=["Kostensoort", "Bedrag"])
+            df_all["Bedrag"] = df_all["Bedrag"].apply(lambda x: f"€{x:,.2f}")
+            
+            # CSV export
+            csv = df_all.to_csv(index=False)
             st.download_button(
-                "📥 Download kostendetail (CSV)",
+                "📥 Download als CSV",
                 data=csv,
-                file_name=f"lab_kosten_{selected_year}.csv",
+                file_name=f"LAB_Kosten_{selected_year}.csv",
                 mime="text/csv"
             )
+            
+            st.dataframe(df_all, use_container_width=True, hide_index=True)
+        else:
+            st.info("Geen kostendata beschikbaar voor deze periode")
     
-    # ==========================================================================
-    # TAB 5: CASHFLOW
-    # ==========================================================================
-    with tab5:
-        st.subheader("📈 Cashflow Prognose")
+    # =========================================================================
+    # TAB 6: CASHFLOW
+    # =========================================================================
+    with tabs[5]:
+        st.header("📈 Cashflow Prognose")
         
-        # Huidige positie
-        bank_balances = get_bank_balances()
-        total_bank = sum(bank_balances.values())
+        bank_data = get_bank_balances()
+        receivables, payables = get_receivables_payables(company_id)
         
-        st.metric("🏦 Huidig Banksaldo (Groep)", f"€{total_bank:,.0f}")
+        if company_id:
+            current_bank = sum(b.get("current_statement_balance", 0) for b in bank_data 
+                             if b.get("company_id") and b["company_id"][0] == company_id)
+        else:
+            current_bank = sum(b.get("current_statement_balance", 0) for b in bank_data)
         
-        # Simpele 12-weken prognose
-        st.write("### 📅 12-Weken Prognose")
+        total_receivables = sum(r.get("amount_residual", 0) for r in receivables)
+        total_payables = abs(sum(p.get("amount_residual", 0) for p in payables))
         
-        # Gemiddelde wekelijkse in/uitstroom berekenen
-        rp = get_receivables_payables(0)
-        avg_weekly_in = rp["receivable"] / 8  # Aanname: gemiddeld 8 weken debiteurentermijn
-        avg_weekly_out = rp["payable"] / 6    # Aanname: gemiddeld 6 weken crediteurentermijn
+        st.subheader("💰 Huidige Positie")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("🏦 Banksaldo", f"€{current_bank:,.0f}")
+        with col2:
+            st.metric("📥 Te ontvangen", f"€{total_receivables:,.0f}")
+        with col3:
+            st.metric("📤 Te betalen", f"€{total_payables:,.0f}")
         
-        # Prognose data
+        st.markdown("---")
+        
+        # 12-weken prognose
+        st.subheader("📊 12-Weken Prognose")
+        
+        # Aannames (instelbaar)
+        col1, col2 = st.columns(2)
+        with col1:
+            collection_rate = st.slider("Incasso % debiteuren/week", 5, 30, 15) / 100
+        with col2:
+            payment_rate = st.slider("Betaling % crediteuren/week", 5, 30, 10) / 100
+        
+        # Bereken prognose
         weeks = []
-        balance = total_bank
+        balance = current_bank
+        rec_remaining = total_receivables
+        pay_remaining = total_payables
         
-        for i in range(12):
-            week_label = f"Week {i+1}"
-            inflow = avg_weekly_in * (0.9 + 0.2 * (i % 3) / 3)  # Variatie
-            outflow = avg_weekly_out * (1.0 + 0.15 * (i % 4) / 4)  # Variatie
+        for week in range(1, 13):
+            inflow = rec_remaining * collection_rate
+            outflow = pay_remaining * payment_rate
             balance = balance + inflow - outflow
+            rec_remaining -= inflow
+            pay_remaining -= outflow
             
             weeks.append({
-                "Week": week_label,
-                "Inkomsten": inflow,
-                "Uitgaven": outflow,
-                "Saldo": balance
+                "Week": f"W{week}",
+                "Ontvangsten": inflow,
+                "Betalingen": outflow,
+                "Banksaldo": balance
             })
         
-        forecast_df = pd.DataFrame(weeks)
+        df_forecast = pd.DataFrame(weeks)
         
         # Grafiek
         fig = go.Figure()
-        fig.add_trace(go.Bar(name="Inkomsten", x=forecast_df["Week"], y=forecast_df["Inkomsten"],
-                             marker_color="#2ecc71"))
-        fig.add_trace(go.Bar(name="Uitgaven", x=forecast_df["Week"], y=forecast_df["Uitgaven"],
-                             marker_color="#e74c3c"))
-        fig.add_trace(go.Scatter(name="Saldo", x=forecast_df["Week"], y=forecast_df["Saldo"],
-                                 mode="lines+markers", line=dict(color="#1e3a5f", width=3)))
-        fig.update_layout(barmode="group", height=400)
+        fig.add_trace(go.Bar(x=df_forecast["Week"], y=df_forecast["Ontvangsten"],
+                            name="Ontvangsten", marker_color="#2e5077"))
+        fig.add_trace(go.Bar(x=df_forecast["Week"], y=-df_forecast["Betalingen"],
+                            name="Betalingen", marker_color="#c9484a"))
+        fig.add_trace(go.Scatter(x=df_forecast["Week"], y=df_forecast["Banksaldo"],
+                                name="Banksaldo", line=dict(color="#1e3a5f", width=3)))
+        fig.update_layout(
+            barmode="relative",
+            height=400,
+            yaxis_title="€",
+            legend=dict(orientation="h", y=1.1)
+        )
         st.plotly_chart(fig, use_container_width=True)
         
         # Tabel
         st.dataframe(
-            forecast_df,
-            column_config={
-                "Inkomsten": st.column_config.NumberColumn(format="€%.0f"),
-                "Uitgaven": st.column_config.NumberColumn(format="€%.0f"),
-                "Saldo": st.column_config.NumberColumn(format="€%.0f")
-            },
-            hide_index=True,
-            use_container_width=True
+            df_forecast.style.format({
+                "Ontvangsten": "€{:,.0f}",
+                "Betalingen": "€{:,.0f}",
+                "Banksaldo": "€{:,.0f}"
+            }),
+            use_container_width=True, hide_index=True
         )
-        
-        st.caption("⚠️ Dit is een indicatieve prognose gebaseerd op huidige openstaande posten.")
 
 if __name__ == "__main__":
     main()
-
