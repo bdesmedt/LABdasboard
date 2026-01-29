@@ -19,6 +19,20 @@ Features:
 - ✅ Klantenkaart voor LAB Projects
 """
 
+# Fallback package installer voor Streamlit Cloud
+import subprocess
+import sys
+
+def install_packages():
+    packages = ['plotly', 'pandas', 'requests', 'folium', 'streamlit-folium']
+    for package in packages:
+        try:
+            __import__(package.replace('-', '_'))
+        except ImportError:
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', package, '-q'])
+
+install_packages()
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px
